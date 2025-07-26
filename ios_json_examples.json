@@ -1,0 +1,281 @@
+{
+    "appointment_retrieval_examples": {
+        "single_day_request": {
+            "request": {
+                "data": {
+                    "command": "Show me my appointments for tomorrow"
+                }
+            },
+            "response": {
+                "result": {
+                    "success": true,
+                    "message": "You have 2 appointments tomorrow: Meeting with John on 2025-07-26 at 14:00 (30 minutes) with John; Call with Sarah on 2025-07-26 at 16:30 (45 minutes) with Sarah",
+                    "intent": "get_appointments",
+                    "details": {
+                        "start_date": "2025-07-26",
+                        "end_date": "2025-07-26"
+                    },
+                    "appointments": [
+                        {
+                            "id": "abc123xyz",
+                            "title": "Meeting with John",
+                            "date": "2025-07-26",
+                            "time": "14:00",
+                            "duration": 30,
+                            "attendees": [
+                                "John"
+                            ],
+                            "status": "confirmed"
+                        },
+                        {
+                            "id": "def456uvw",
+                            "title": "Call with Sarah",
+                            "date": "2025-07-26",
+                            "time": "16:30",
+                            "duration": 45,
+                            "attendees": [
+                                "Sarah"
+                            ],
+                            "status": "confirmed"
+                        }
+                    ]
+                }
+            }
+        },
+        "weekly_request": {
+            "request": {
+                "data": {
+                    "command": "Show me all my appointments for this week"
+                }
+            },
+            "response": {
+                "result": {
+                    "success": true,
+                    "message": "You have 4 appointments this week",
+                    "intent": "get_appointments",
+                    "details": {
+                        "start_date": "2025-07-25",
+                        "end_date": "2025-07-31"
+                    },
+                    "appointments": [
+                        {
+                            "id": "mon001",
+                            "title": "Team Standup",
+                            "date": "2025-07-25",
+                            "time": "09:00",
+                            "duration": 15,
+                            "attendees": [
+                                "Alice",
+                                "Bob",
+                                "Charlie"
+                            ],
+                            "status": "confirmed"
+                        },
+                        {
+                            "id": "mon002",
+                            "title": "Client Presentation",
+                            "date": "2025-07-25",
+                            "time": "14:00",
+                            "duration": 60,
+                            "attendees": [
+                                "Client Team"
+                            ],
+                            "status": "confirmed"
+                        },
+                        {
+                            "id": "tue001",
+                            "title": "Doctor Appointment",
+                            "date": "2025-07-26",
+                            "time": "10:30",
+                            "duration": 30,
+                            "attendees": [],
+                            "status": "confirmed"
+                        },
+                        {
+                            "id": "wed001",
+                            "title": "Project Review",
+                            "date": "2025-07-27",
+                            "time": "15:00",
+                            "duration": 90,
+                            "attendees": [
+                                "Manager",
+                                "Tech Lead"
+                            ],
+                            "status": "confirmed"
+                        }
+                    ]
+                }
+            }
+        },
+        "no_appointments_found": {
+            "request": {
+                "data": {
+                    "command": "What meetings do I have on Sunday?"
+                }
+            },
+            "response": {
+                "result": {
+                    "success": true,
+                    "message": "No appointments found for 2025-07-30.",
+                    "intent": "get_appointments",
+                    "details": {
+                        "start_date": "2025-07-30",
+                        "end_date": "2025-07-30"
+                    },
+                    "appointments": []
+                }
+            }
+        },
+        "date_range_request": {
+            "request": {
+                "data": {
+                    "command": "List my meetings from July 28th to July 30th"
+                }
+            },
+            "response": {
+                "result": {
+                    "success": true,
+                    "message": "You have 3 appointments from July 28th to July 30th",
+                    "intent": "get_appointments",
+                    "details": {
+                        "start_date": "2025-07-28",
+                        "end_date": "2025-07-30"
+                    },
+                    "appointments": [
+                        {
+                            "id": "thu001",
+                            "title": "Lunch with Friends",
+                            "date": "2025-07-28",
+                            "time": "12:00",
+                            "duration": 120,
+                            "attendees": [
+                                "Emma",
+                                "Mike"
+                            ],
+                            "status": "confirmed"
+                        },
+                        {
+                            "id": "fri001",
+                            "title": "Weekly Report",
+                            "date": "2025-07-29",
+                            "time": "16:00",
+                            "duration": 30,
+                            "attendees": [],
+                            "status": "confirmed"
+                        },
+                        {
+                            "id": "sat001",
+                            "title": "Gym Session",
+                            "date": "2025-07-30",
+                            "time": "08:00",
+                            "duration": 60,
+                            "attendees": [],
+                            "status": "confirmed"
+                        }
+                    ]
+                }
+            }
+        }
+    },
+    "appointment_creation_examples": {
+        "successful_creation": {
+            "request": {
+                "data": {
+                    "command": "Schedule a meeting with John tomorrow at 2 PM for 30 minutes"
+                }
+            },
+            "response": {
+                "result": {
+                    "success": true,
+                    "message": "I've scheduled a meeting with John tomorrow at 2 PM for 30 minutes.",
+                    "intent": "schedule_appointment",
+                    "details": {
+                        "title": "Meeting with John",
+                        "date": "2025-07-26",
+                        "time": "14:00",
+                        "duration": 30,
+                        "attendees": [
+                            "John"
+                        ]
+                    }
+                }
+            }
+        }
+    },
+    "error_examples": {
+        "index_not_ready": {
+            "response": {
+                "error": {
+                    "message": "INTERNAL",
+                    "status": "INTERNAL"
+                }
+            }
+        },
+        "invalid_command": {
+            "request": {
+                "data": {
+                    "command": "What's the weather like?"
+                }
+            },
+            "response": {
+                "result": {
+                    "success": false,
+                    "message": "I didn't understand that command. Please try again with a clear instruction to schedule, set availability, cancel, or get appointments.",
+                    "intent": "unclear",
+                    "details": {}
+                }
+            }
+        }
+    },
+    "ui_guidelines": {
+        "appointment_display": {
+            "description": "How to display appointments in iOS UI",
+            "suggestions": {
+                "list_view": {
+                    "primary_text": "appointment.title",
+                    "secondary_text": "appointment.date + ' at ' + appointment.time",
+                    "detail_text": "appointment.duration + ' minutes'",
+                    "attendees_display": "Join attendees with commas if array is not empty"
+                },
+                "calendar_view": {
+                    "date_grouping": "Group appointments by appointment.date",
+                    "time_sorting": "Sort by appointment.time within each date",
+                    "duration_display": "Show as time blocks based on duration"
+                },
+                "card_view": {
+                    "title": "appointment.title",
+                    "datetime": "Format: 'Monday, July 26 at 2:00 PM'",
+                    "duration": "Format: '30 minutes'",
+                    "attendees": "Show as chips/tags if not empty",
+                    "status": "Use appointment.status for styling (confirmed/pending/cancelled)"
+                }
+            }
+        },
+        "time_formatting": {
+            "24_hour_to_12_hour": {
+                "example": "14:00 → 2:00 PM",
+                "swift_code": "Use DateFormatter with 'HH:mm' input and 'h:mm a' output"
+            },
+            "date_formatting": {
+                "example": "2025-07-26 → July 26, 2025",
+                "swift_code": "Use DateFormatter with 'yyyy-MM-dd' input and 'MMMM d, yyyy' output"
+            }
+        },
+        "empty_states": {
+            "no_appointments": {
+                "title": "No appointments found",
+                "message": "You have no appointments for the selected period.",
+                "action": "Try selecting a different date range or schedule a new appointment."
+            }
+        },
+        "loading_states": {
+            "while_fetching": {
+                "show": "Loading indicator with text 'Fetching your appointments...'"
+            }
+        }
+    },
+    "swift_model_example": {
+        "description": "Suggested Swift data models for parsing the JSON response",
+        "code": "// MARK: - Response Models\nstruct AppointmentResponse: Codable {\n    let result: AppointmentResult?\n    let error: ErrorResponse?\n}\n\nstruct AppointmentResult: Codable {\n    let success: Bool\n    let message: String\n    let intent: String\n    let details: AppointmentDetails\n    let appointments: [Appointment]?\n}\n\nstruct AppointmentDetails: Codable {\n    let startDate: String?\n    let endDate: String?\n    let title: String?\n    let date: String?\n    let time: String?\n    let duration: Int?\n    let attendees: [String]?\n    \n    enum CodingKeys: String, CodingKey {\n        case startDate = \"start_date\"\n        case endDate = \"end_date\"\n        case title, date, time, duration, attendees\n    }\n}\n\nstruct Appointment: Codable, Identifiable {\n    let id: String\n    let title: String\n    let date: String\n    let time: String\n    let duration: Int\n    let attendees: [String]\n    let status: String\n    \n    // Computed properties for UI\n    var formattedDateTime: String {\n        // Convert date and time to user-friendly format\n        // Implementation depends on your date formatting needs\n    }\n    \n    var attendeesText: String {\n        attendees.isEmpty ? \"No attendees\" : attendees.joined(separator: \", \")\n    }\n}\n\nstruct ErrorResponse: Codable {\n    let message: String\n    let status: String\n}"
+    }
+}

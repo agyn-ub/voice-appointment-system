@@ -1,0 +1,378 @@
+{
+    "api_endpoint": {
+        "url": "https://us-central1-learning-auth-e6ea2.cloudfunctions.net/processVoiceCommand",
+        "method": "POST",
+        "content_type": "application/json"
+    },
+    "single_voice_interface": {
+        "description": "One microphone button → speech to text → send to API → handle response",
+        "workflow": [
+            "1. User taps microphone button",
+            "2. iOS Speech Recognition converts speech to text",
+            "3. Send text to processVoiceCommand endpoint",
+            "4. AI determines intent and processes command",
+            "5. Return structured response for UI updates"
+        ]
+    },
+    "voice_commands_examples": {
+        "create_appointments": [
+            {
+                "voice_input": "Schedule a meeting with John tomorrow at 2 PM for 30 minutes",
+                "request": {
+                    "data": {
+                        "command": "Schedule a meeting with John tomorrow at 2 PM for 30 minutes"
+                    }
+                },
+                "response": {
+                    "result": {
+                        "success": true,
+                        "message": "I've scheduled a meeting with John tomorrow at 2 PM for 30 minutes.",
+                        "intent": "schedule_appointment",
+                        "details": {
+                            "title": "Meeting with John",
+                            "date": "2025-07-26",
+                            "time": "14:00",
+                            "duration": 30,
+                            "attendees": [
+                                "John"
+                            ]
+                        }
+                    }
+                },
+                "ui_action": "Show success message, refresh calendar view, optionally speak confirmation"
+            },
+            {
+                "voice_input": "Book a doctor appointment on Friday at 10:30 AM for one hour",
+                "request": {
+                    "data": {
+                        "command": "Book a doctor appointment on Friday at 10:30 AM for one hour"
+                    }
+                },
+                "response": {
+                    "result": {
+                        "success": true,
+                        "message": "I've scheduled a doctor appointment on Friday at 10:30 AM for one hour.",
+                        "intent": "schedule_appointment",
+                        "details": {
+                            "title": "Doctor Appointment",
+                            "date": "2025-07-29",
+                            "time": "10:30",
+                            "duration": 60,
+                            "attendees": []
+                        }
+                    }
+                },
+                "ui_action": "Show success message, refresh calendar view"
+            }
+        ],
+        "view_appointments": [
+            {
+                "voice_input": "Show me my appointments for today",
+                "request": {
+                    "data": {
+                        "command": "Show me my appointments for today"
+                    }
+                },
+                "response": {
+                    "result": {
+                        "success": true,
+                        "message": "You have 2 appointments today: Team meeting at 9:00 AM (30 minutes); Lunch with Sarah at 12:30 PM (60 minutes)",
+                        "intent": "get_appointments",
+                        "details": {
+                            "start_date": "2025-07-25",
+                            "end_date": "2025-07-25"
+                        },
+                        "appointments": [
+                            {
+                                "id": "today001",
+                                "title": "Team Meeting",
+                                "date": "2025-07-25",
+                                "time": "09:00",
+                                "duration": 30,
+                                "attendees": [
+                                    "Alice",
+                                    "Bob"
+                                ],
+                                "status": "confirmed"
+                            },
+                            {
+                                "id": "today002",
+                                "title": "Lunch with Sarah",
+                                "date": "2025-07-25",
+                                "time": "12:30",
+                                "duration": 60,
+                                "attendees": [
+                                    "Sarah"
+                                ],
+                                "status": "confirmed"
+                            }
+                        ]
+                    }
+                },
+                "ui_action": "Display appointments list, optionally speak summary"
+            },
+            {
+                "voice_input": "What do I have this week?",
+                "request": {
+                    "data": {
+                        "command": "What do I have this week?"
+                    }
+                },
+                "response": {
+                    "result": {
+                        "success": true,
+                        "message": "You have 5 appointments this week",
+                        "intent": "get_appointments",
+                        "details": {
+                            "start_date": "2025-07-25",
+                            "end_date": "2025-07-31"
+                        },
+                        "appointments": [
+                            {
+                                "id": "week001",
+                                "title": "Team Meeting",
+                                "date": "2025-07-25",
+                                "time": "09:00",
+                                "duration": 30,
+                                "attendees": [
+                                    "Team"
+                                ],
+                                "status": "confirmed"
+                            },
+                            {
+                                "id": "week002",
+                                "title": "Client Call",
+                                "date": "2025-07-26",
+                                "time": "14:00",
+                                "duration": 45,
+                                "attendees": [
+                                    "Client"
+                                ],
+                                "status": "confirmed"
+                            },
+                            {
+                                "id": "week003",
+                                "title": "Project Review",
+                                "date": "2025-07-27",
+                                "time": "16:00",
+                                "duration": 60,
+                                "attendees": [
+                                    "Manager"
+                                ],
+                                "status": "confirmed"
+                            }
+                        ]
+                    }
+                },
+                "ui_action": "Show weekly calendar view with all appointments"
+            },
+            {
+                "voice_input": "Do I have anything tomorrow?",
+                "request": {
+                    "data": {
+                        "command": "Do I have anything tomorrow?"
+                    }
+                },
+                "response": {
+                    "result": {
+                        "success": true,
+                        "message": "No appointments found for 2025-07-26.",
+                        "intent": "get_appointments",
+                        "details": {
+                            "start_date": "2025-07-26",
+                            "end_date": "2025-07-26"
+                        },
+                        "appointments": []
+                    }
+                },
+                "ui_action": "Show empty state or 'No appointments' message"
+            }
+        ],
+        "cancel_appointments": [
+            {
+                "voice_input": "Cancel my meeting with John tomorrow",
+                "request": {
+                    "data": {
+                        "command": "Cancel my meeting with John tomorrow"
+                    }
+                },
+                "response": {
+                    "result": {
+                        "success": true,
+                        "message": "Cancelled 1 appointment(s) titled 'Meeting with John' on 2025-07-26.",
+                        "intent": "cancel_appointment",
+                        "details": {
+                            "title": "Meeting with John",
+                            "date": "2025-07-26"
+                        }
+                    }
+                },
+                "ui_action": "Show success message, refresh calendar, remove cancelled appointment"
+            }
+        ],
+        "set_availability": [
+            {
+                "voice_input": "Set my availability Monday to Friday 9 AM to 5 PM",
+                "request": {
+                    "data": {
+                        "command": "Set my availability Monday to Friday 9 AM to 5 PM"
+                    }
+                },
+                "response": {
+                    "result": {
+                        "success": true,
+                        "message": "Your availability has been updated.",
+                        "intent": "set_availability",
+                        "details": {
+                            "monday": {
+                                "start": "09:00",
+                                "end": "17:00"
+                            },
+                            "tuesday": {
+                                "start": "09:00",
+                                "end": "17:00"
+                            },
+                            "wednesday": {
+                                "start": "09:00",
+                                "end": "17:00"
+                            },
+                            "thursday": {
+                                "start": "09:00",
+                                "end": "17:00"
+                            },
+                            "friday": {
+                                "start": "09:00",
+                                "end": "17:00"
+                            },
+                            "saturday": {
+                                "start": "",
+                                "end": ""
+                            },
+                            "sunday": {
+                                "start": "",
+                                "end": ""
+                            }
+                        }
+                    }
+                },
+                "ui_action": "Show success message, update availability settings"
+            }
+        ],
+        "unclear_commands": [
+            {
+                "voice_input": "What's the weather like?",
+                "request": {
+                    "data": {
+                        "command": "What's the weather like?"
+                    }
+                },
+                "response": {
+                    "result": {
+                        "success": false,
+                        "message": "I didn't understand that command. Please try again with a clear instruction to schedule, set availability, cancel, or get appointments.",
+                        "intent": "unclear",
+                        "details": {}
+                    }
+                },
+                "ui_action": "Show help message or suggested voice commands"
+            }
+        ]
+    },
+    "ios_implementation_guide": {
+        "single_microphone_button": {
+            "user_interaction": "Tap and hold microphone button to speak",
+            "visual_feedback": "Show listening animation while recording",
+            "audio_feedback": "Play start/stop recording sounds"
+        },
+        "speech_to_text": {
+            "framework": "Use iOS Speech Recognition framework",
+            "implementation": "Convert audio to text, send text string to API"
+        },
+        "api_call": {
+            "method": "POST",
+            "url": "https://us-central1-learning-auth-e6ea2.cloudfunctions.net/processVoiceCommand",
+            "body": {
+                "data": {
+                    "command": "USER_SPEECH_TEXT_HERE"
+                }
+            },
+            "headers": {
+                "Content-Type": "application/json"
+            }
+        },
+        "response_handling": {
+            "check_success": "if response.result.success == true",
+            "check_intent": "Use response.result.intent to determine UI action",
+            "display_data": "Use response.result.appointments array for UI",
+            "voice_feedback": "Use response.result.message for text-to-speech"
+        },
+        "ui_updates_by_intent": {
+            "schedule_appointment": [
+                "Show success toast/alert",
+                "Refresh calendar view",
+                "Optionally speak confirmation message"
+            ],
+            "get_appointments": [
+                "Update appointments list/calendar",
+                "Show appointments in selected view (list/calendar)",
+                "Handle empty state if appointments array is empty"
+            ],
+            "cancel_appointment": [
+                "Show cancellation confirmation",
+                "Remove cancelled appointment from UI",
+                "Refresh calendar view"
+            ],
+            "set_availability": [
+                "Update availability settings",
+                "Show success confirmation"
+            ],
+            "unclear": [
+                "Show help dialog",
+                "Display example voice commands",
+                "Prompt user to try again"
+            ]
+        }
+    },
+    "natural_voice_commands": {
+        "appointment_creation": [
+            "Schedule a meeting with John tomorrow at 2 PM for 30 minutes",
+            "Book a dentist appointment next Tuesday at 10 AM",
+            "Set up a call with the client on Friday at 3 PM for one hour",
+            "Add a lunch meeting with Sarah next Monday at noon",
+            "Schedule a team standup tomorrow morning at 9 AM for 15 minutes"
+        ],
+        "appointment_viewing": [
+            "Show me my appointments for today",
+            "What do I have tomorrow?",
+            "List my meetings for this week",
+            "Do I have anything on Friday?",
+            "Show me my schedule for next week",
+            "What appointments do I have from Monday to Wednesday?",
+            "List all my meetings this month"
+        ],
+        "appointment_cancellation": [
+            "Cancel my meeting with John tomorrow",
+            "Remove the dentist appointment on Tuesday",
+            "Cancel all meetings on Friday"
+        ],
+        "availability_setting": [
+            "Set my availability Monday to Friday 9 AM to 5 PM",
+            "I'm available weekdays from 8 to 6",
+            "Update my schedule to be free on weekends"
+        ]
+    },
+    "error_handling": {
+        "network_errors": {
+            "scenario": "No internet connection",
+            "ui_response": "Show 'Please check your internet connection' message"
+        },
+        "speech_recognition_errors": {
+            "scenario": "Speech not recognized clearly",
+            "ui_response": "Show 'Please try speaking again' message"
+        },
+        "api_errors": {
+            "scenario": "Server error or invalid response",
+            "ui_response": "Show 'Something went wrong, please try again' message"
+        }
+    }
+}
