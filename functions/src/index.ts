@@ -4,8 +4,10 @@
  */
 
 import { onCall } from "firebase-functions/v2/https";
+import { onRequest } from "firebase-functions/v2/https";
 import { defineString } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
+import { google } from "googleapis";
 
 // Initialize Firebase Admin SDK for server-side operations
 import { initializeApp } from "firebase-admin/app";
@@ -21,6 +23,30 @@ const customDb = getFirestore();
 const openaiApiKey = defineString("OPENAI_API_KEY");
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || openaiApiKey.value();
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+
+// Google OAuth configuration
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const REDIRECT_URI = `https://${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
+
+// App ID for consistent document paths
+const APP_ID = "my-voice-calendly-app";
+
+// Define TypeScript interfaces for our data structures
+interface AppointmentData {
+    title: string;
+    date: string;
+    time: string;
+    duration: number;
+    attendees: string[];
+    timestamp: Date;
+    status: string;
+    createdAt: FieldValue;
+    googleCalendarEventId?: string | null;
+    meetingLink?: string | null;
+    calendarSynced?: boolean;
+    calendarSyncError?: string;
+}
 
 /**
  * Calculate similarity between two strings using Levenshtein distance
@@ -93,20 +119,16 @@ function levenshteinDistance(str1: string, str2: string): number {
  * @param context - Contains authentication and call context
  */
 export const processVoiceCommand = onCall(async (request) => {
-    const { data } = request;
+    const { data, auth } = request;
 
-    // --- TEMPORARY: User ID without Authentication ---
-    // As per your request, we are skipping authentication for now.
-    // In a real application, auth?.uid would provide the authenticated user's ID.
-    // For demonstration, we'll use a simple, non-persistent placeholder ID.
-    /*
+    // --- FIREBASE AUTHENTICATION ---
+    // Ensure user is authenticated
     if (!auth) {
         throw new Error('User must be authenticated to use this function.');
     }
+
     const userId = auth.uid;
-    */
-    // For now, let's use a fixed placeholder for testing purposes.
-    const userId = "test-user-id-no-auth";
+    logger.info(`Processing command for authenticated user: ${userId}`);
     // ---------------------------------------------------
 
     const userCommandText = data.command; // The transcribed voice command from the client app
@@ -117,6 +139,97 @@ export const processVoiceCommand = onCall(async (request) => {
     }
 
     logger.info(`Processing command for user ${userId}: "${userCommandText}"`);
+
+    /**
+     * Helper function to get an authenticated Google OAuth2 client
+     * Handles token refresh and storage
+     * 
+     * @param userId - User ID to retrieve tokens for
+     * @returns Authenticated OAuth2Client
+     */
+    async function getGoogleOAuth2Client(userId: string) {
+        try {
+            logger.info(`Getting Google OAuth client for user: ${userId}`);
+
+            // Check if Google OAuth credentials are configured
+            if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
+                logger.error("Google OAuth credentials not configured");
+                throw new Error('Google Calendar integration not properly configured. Missing OAuth credentials.');
+            }
+
+            // Initialize OAuth2 client
+            const oAuth2Client = new google.auth.OAuth2(
+                GOOGLE_CLIENT_ID,
+                GOOGLE_CLIENT_SECRET,
+                REDIRECT_URI
+            );
+
+            // Fetch tokens from Firestore
+            const tokenDoc = await customDb
+                .collection('artifacts')
+                .doc(APP_ID)
+                .collection('users')
+                .doc(userId)
+                .collection('tokens')
+                .doc('googleCalendar')
+                .get();
+
+            // Check if tokens exist
+            if (!tokenDoc.exists) {
+                logger.error(`No Google Calendar tokens found for user: ${userId}`);
+                throw new Error('Google Calendar not connected. Please authorize access first.');
+            }
+
+            const tokenData = tokenDoc.data();
+
+            // Check if refresh token exists
+            if (!tokenData?.refresh_token) {
+                logger.error(`Missing refresh token for user: ${userId}`);
+                throw new Error('Google Calendar connection is incomplete. Please reauthorize access.');
+            }
+
+            // Set credentials on OAuth client
+            oAuth2Client.setCredentials({
+                refresh_token: tokenData.refresh_token,
+                access_token: tokenData.access_token,
+                expiry_date: tokenData.expiry_date
+            });
+
+            // Check if token is expired or about to expire (within 5 minutes)
+            const now = Date.now();
+            const tokenExpiryTime = tokenData.expiry_date;
+            const fiveMinutesInMs = 5 * 60 * 1000;
+
+            if (!tokenExpiryTime || now + fiveMinutesInMs >= tokenExpiryTime) {
+                logger.info(`Refreshing access token for user: ${userId}`);
+
+                // Refresh the token
+                const refreshResponse = await oAuth2Client.refreshAccessToken();
+                const tokens = refreshResponse.credentials;
+
+                // Update tokens in Firestore
+                await customDb
+                    .collection('artifacts')
+                    .doc(APP_ID)
+                    .collection('users')
+                    .doc(userId)
+                    .collection('tokens')
+                    .doc('googleCalendar')
+                    .set({
+                        access_token: tokens.access_token,
+                        expiry_date: tokens.expiry_date,
+                        last_updated: FieldValue.serverTimestamp()
+                    }, { merge: true });
+
+                logger.info(`Successfully refreshed and stored tokens for user: ${userId}`);
+            }
+
+            return oAuth2Client;
+        } catch (error) {
+            logger.error('Error getting Google OAuth client:', error);
+            throw new Error(`Failed to initialize Google Calendar: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        }
+    }
 
     // --- LLM Integration: Construct Prompt and Make API Call ---
     let llmResponseJson;
@@ -142,13 +255,15 @@ export const processVoiceCommand = onCall(async (request) => {
          "date": "YYYY-MM-DD",       // e.g., "2025-07-25"
          "time": "HH:MM",            // e.g., "14:30" (24-hour format)
          "duration": "number",       // e.g., 30 (in minutes)
-         "attendees": ["string"]     // e.g., ["John", "Alice"] (can be empty array if no attendees mentioned)
+         "attendees": ["string"],     // e.g., ["John", "Alice"] (can be empty array if no attendees mentioned)
+         "meeting_platform": "string" // Optional: e.g., "Google Meet", "Zoom", "In Person"
        }
        Example User Commands:
        - "Schedule a project review with Alice and Bob for next Tuesday at 10 AM for 30 minutes."
        - "Make an appointment for tomorrow with John for 5 PM" (title can be empty, will be auto-generated)
        - "Schedule a meeting with Sarah tomorrow at 2 PM for 1 hour"
        - "Book an appointment with John for next Friday at 3 PM"
+       - "Set up a Google Meet with the team tomorrow at 9 AM"
 
     2. "set_availability": For updating user's general availability.
        Details: {
@@ -284,8 +399,9 @@ export const processVoiceCommand = onCall(async (request) => {
                 // For simplicity, we'll skip the detailed check in this basic example,
                 // but you would add it before adding the appointment.
 
-                await customDb.collection('users').doc(userId).collection('appointments').add({
-                    title: appointmentTitle, // Use the generated or provided title
+                // Create appointment data for Firestore
+                const appointmentData: AppointmentData = {
+                    title: appointmentTitle,
                     date: details.date, // Store as string for easy display
                     time: details.time, // Store as string
                     duration: details.duration, // Store as number
@@ -293,8 +409,99 @@ export const processVoiceCommand = onCall(async (request) => {
                     timestamp: appointmentDateTime, // Store as Date/Timestamp for proper ordering and querying
                     status: 'confirmed',
                     createdAt: FieldValue.serverTimestamp() // Timestamp of creation
-                });
-                clientMessage = llm_response_message || `Appointment "${appointmentTitle}" scheduled successfully.`;
+                };
+
+                // Google Calendar Integration
+                let googleCalendarEventId = null;
+                let meetingLink = null;
+                let calendarSyncSuccess = false;
+
+                try {
+                    // Try to sync with Google Calendar if available
+                    const oAuth2Client = await getGoogleOAuth2Client(userId);
+                    const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
+
+                    // Format attendees for Google Calendar
+                    const calendarAttendees = details.attendees?.map((attendee: string) => ({
+                        email: attendee.includes('@') ? attendee : `${attendee.toLowerCase().replace(/\s+/g, '.')}@example.com`,
+                        displayName: attendee
+                    })) || [];
+
+                    // Calculate end time
+                    const endDateTime = new Date(appointmentDateTime);
+                    endDateTime.setMinutes(endDateTime.getMinutes() + details.duration);
+
+                    // Create event resource
+                    const eventResource: any = {
+                        summary: appointmentTitle,
+                        description: `Appointment created via Voice Command System`,
+                        start: {
+                            dateTime: appointmentDateTime.toISOString(),
+                            timeZone: 'America/Los_Angeles', // Default timezone, could be made dynamic
+                        },
+                        end: {
+                            dateTime: endDateTime.toISOString(),
+                            timeZone: 'America/Los_Angeles', // Default timezone, could be made dynamic
+                        },
+                        attendees: calendarAttendees,
+                        reminders: {
+                            useDefault: true
+                        }
+                    };
+
+                    // Add Google Meet integration if requested
+                    const meetingPlatform = details.meeting_platform?.toLowerCase() || '';
+                    if (meetingPlatform.includes('google meet') || meetingPlatform.includes('meet')) {
+                        eventResource.conferenceData = {
+                            createRequest: {
+                                requestId: `${userId}-${Date.now()}`,
+                                conferenceSolutionKey: { type: 'hangoutsMeet' }
+                            }
+                        };
+                    }
+
+                    // Insert event to Google Calendar
+                    logger.info(`Creating Google Calendar event for user ${userId}: "${appointmentTitle}"`);
+                    const calendarResponse = await calendar.events.insert({
+                        calendarId: 'primary',
+                        conferenceDataVersion: 1, // Required for Google Meet
+                        sendUpdates: 'all', // Send email notifications to attendees
+                        requestBody: eventResource
+                    });
+
+                    // Extract event ID and meeting link
+                    googleCalendarEventId = calendarResponse.data.id || null;
+                    meetingLink = calendarResponse.data.hangoutLink || null;
+                    calendarSyncSuccess = true;
+
+                    logger.info(`Successfully created Google Calendar event: ${googleCalendarEventId}`);
+
+                    // Add Google Calendar info to appointment data
+                    if (googleCalendarEventId) {
+                        appointmentData.googleCalendarEventId = googleCalendarEventId;
+                    }
+                    if (meetingLink) {
+                        appointmentData.meetingLink = meetingLink;
+                    }
+                    appointmentData.calendarSynced = true;
+
+                } catch (error) {
+                    // Log error but continue with Firestore save
+                    logger.error(`Failed to sync with Google Calendar: ${error instanceof Error ? error.message : 'Unknown error'}`);
+                    appointmentData.calendarSynced = false;
+                    appointmentData.calendarSyncError = error instanceof Error ? error.message : 'Unknown error';
+                }
+
+                // Save appointment to Firestore
+                await customDb.collection('users').doc(userId).collection('appointments').add(appointmentData);
+
+                // Update client message based on calendar sync status
+                if (calendarSyncSuccess) {
+                    const meetingInfo = meetingLink ? ` A Google Meet link has been created.` : '';
+                    clientMessage = llm_response_message || `Appointment "${appointmentTitle}" scheduled successfully and synced with Google Calendar.${meetingInfo}`;
+                } else {
+                    clientMessage = llm_response_message || `Appointment "${appointmentTitle}" scheduled successfully in the app only. Failed to sync with Google Calendar.`;
+                }
                 break;
 
             case "set_availability":
@@ -323,6 +530,8 @@ export const processVoiceCommand = onCall(async (request) => {
                 let cancelledCount = 0;
                 let availableAppointments: any[] = [];
                 let suggestedMatches: string[] = [];
+                let appointmentsToDeleteFromGCal: { id: string; googleCalendarEventId: string }[] = [];
+                let calendarDeleteSuccess = false;
 
                 if (!appointmentsToCancelQuery.empty) {
                     const batch = customDb.batch();
@@ -342,7 +551,8 @@ export const processVoiceCommand = onCall(async (request) => {
                                 id: docSnap.id,
                                 title: appointmentData.title,
                                 time: appointmentData.time || '',
-                                attendees: appointmentData.attendees || []
+                                attendees: appointmentData.attendees || [],
+                                googleCalendarEventId: appointmentData.googleCalendarEventId || null
                             });
 
                             // Smart matching logic
@@ -376,7 +586,17 @@ export const processVoiceCommand = onCall(async (request) => {
                             }
 
                             if (titleMatch || timeMatch || attendeeMatch || fuzzyMatch) {
+                                // Add to batch delete
                                 batch.delete(docSnap.ref);
+
+                                // Track for Google Calendar deletion if needed
+                                if (appointmentData.googleCalendarEventId) {
+                                    appointmentsToDeleteFromGCal.push({
+                                        id: docSnap.id,
+                                        googleCalendarEventId: appointmentData.googleCalendarEventId
+                                    });
+                                }
+
                                 cancelledCount++;
                             }
                         } catch (error) {
@@ -386,7 +606,44 @@ export const processVoiceCommand = onCall(async (request) => {
                     });
 
                     if (cancelledCount > 0) {
+                        // Delete from Firestore
                         await batch.commit();
+
+                        // Try to delete from Google Calendar if applicable
+                        if (appointmentsToDeleteFromGCal.length > 0) {
+                            try {
+                                const oAuth2Client = await getGoogleOAuth2Client(userId);
+                                const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
+
+                                // Delete events in parallel
+                                const deletePromises = appointmentsToDeleteFromGCal.map(async (apt) => {
+                                    try {
+                                        await calendar.events.delete({
+                                            calendarId: 'primary',
+                                            eventId: apt.googleCalendarEventId,
+                                            sendUpdates: 'all' // Notify attendees
+                                        });
+                                        logger.info(`Successfully deleted Google Calendar event: ${apt.googleCalendarEventId}`);
+                                        return { success: true, id: apt.id };
+                                    } catch (error) {
+                                        logger.error(`Failed to delete Google Calendar event ${apt.googleCalendarEventId}:`, error);
+                                        return { success: false, id: apt.id, error };
+                                    }
+                                });
+
+                                // Wait for all delete operations to complete
+                                const results = await Promise.all(deletePromises);
+                                const successfulDeletes = results.filter(r => r.success).length;
+
+                                if (successfulDeletes > 0) {
+                                    logger.info(`Successfully deleted ${successfulDeletes} events from Google Calendar`);
+                                    calendarDeleteSuccess = true;
+                                }
+                            } catch (error) {
+                                logger.error("Error deleting events from Google Calendar:", error);
+                                // Continue with the response, don't block on Google Calendar errors
+                            }
+                        }
                     } else {
                         // No exact matches found - provide smart suggestions
                         if (details.title) {
@@ -409,7 +666,8 @@ export const processVoiceCommand = onCall(async (request) => {
                 if (cancelledCount > 0) {
                     const countText = cancelledCount === 1 ? "appointment" : "appointments";
                     const safeTitle = details.title || "appointment";
-                    clientMessage = `Successfully cancelled ${cancelledCount} ${countText} matching "${safeTitle}" on ${details.date}.`;
+                    const calendarMsg = calendarDeleteSuccess ? " and removed from Google Calendar" : "";
+                    clientMessage = `Successfully cancelled ${cancelledCount} ${countText} matching "${safeTitle}" on ${details.date}${calendarMsg}.`;
                 } else {
                     if (suggestedMatches.length > 0) {
                         const safeTitle = details.title || "appointment";
@@ -469,7 +727,10 @@ export const processVoiceCommand = onCall(async (request) => {
                         time: appointmentData.time,
                         duration: appointmentData.duration,
                         attendees: appointmentData.attendees || [],
-                        status: appointmentData.status
+                        status: appointmentData.status,
+                        meetingLink: appointmentData.meetingLink || null,
+                        googleCalendarEventId: appointmentData.googleCalendarEventId || null,
+                        calendarSynced: appointmentData.calendarSynced || false
                     });
                 });
 
@@ -478,9 +739,10 @@ export const processVoiceCommand = onCall(async (request) => {
 
                 if (appointments.length > 0) {
                     // Format appointments for natural language response
-                    const appointmentsSummary = appointments.map(apt =>
-                        `${apt.title} on ${apt.date} at ${apt.time} (${apt.duration} minutes)${apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : ''}`
-                    ).join('; ');
+                    const appointmentsSummary = appointments.map(apt => {
+                        const meetingInfo = apt.meetingLink ? ` (Google Meet available)` : '';
+                        return `${apt.title} on ${apt.date} at ${apt.time} (${apt.duration} minutes)${apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : ''}${meetingInfo}`;
+                    }).join('; ');
 
                     clientMessage = llm_response_message || `You have ${appointments.length} appointment(s): ${appointmentsSummary}`;
                 } else {
@@ -493,7 +755,11 @@ export const processVoiceCommand = onCall(async (request) => {
                     message: clientMessage,
                     intent: intent,
                     details: details,
-                    appointments: appointments // Include the actual appointments data
+                    appointments: appointments.map(apt => ({
+                        ...apt,
+                        meetingLink: apt.meetingLink || null,
+                        calendarSynced: apt.calendarSynced || false
+                    })) // Include the actual appointments data with meeting links
                 };
 
             case "unclear":
@@ -519,5 +785,181 @@ export const processVoiceCommand = onCall(async (request) => {
         logger.error("Error during Firestore operation or intent dispatch:", error);
         // Re-throw as an Error for the client to handle
         throw new Error(error instanceof Error ? error.message : 'An unexpected server error occurred during action processing.');
+    }
+});
+
+/**
+ * Google OAuth 2.0 Callback Handler
+ * Handles the OAuth callback from Google after user grants consent
+ * 
+ * @param req - HTTP request containing authorization code and state
+ * @param res - HTTP response to send back to user
+ */
+export const googleOAuthCallback = onRequest(async (req, res) => {
+    try {
+        // 1. Extract code and state from query parameters
+        const { code, state } = req.query;
+
+        if (!code || !state) {
+            logger.error("Missing required parameters in OAuth callback", { code: !!code, state: !!state });
+            res.status(400).send(`
+                <html>
+                    <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                        <h1 style="color: #d32f2f;">Authorization Failed</h1>
+                        <p>Missing required parameters. Please try the authorization process again.</p>
+                        <button onclick="window.close()">Close Window</button>
+                    </body>
+                </html>
+            `);
+            return;
+        }
+
+        // 2. Extract User ID from state (Firebase Auth UID)
+        const userId = state as string;
+
+        // Validate that the userId is a valid Firebase Auth UID format
+        if (!userId || userId.length < 10) {
+            logger.error("Invalid user ID in OAuth callback state:", userId);
+            res.status(400).send(`
+                <html>
+                    <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                        <h1 style="color: #d32f2f;">Authorization Failed</h1>
+                        <p>Invalid user session. Please try the authorization process again.</p>
+                        <button onclick="window.close()">Close Window</button>
+                    </body>
+                </html>
+            `);
+            return;
+        }
+
+        logger.info(`Processing OAuth callback for authenticated user: ${userId}`);
+
+        // 3. Retrieve Google OAuth credentials from environment
+        const clientId = process.env.GOOGLE_CLIENT_ID;
+        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+        if (!clientId || !clientSecret) {
+            logger.error("Google OAuth credentials not configured");
+            res.status(500).send(`
+                <html>
+                    <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                        <h1 style="color: #d32f2f;">Configuration Error</h1>
+                        <p>OAuth credentials not properly configured. Please contact support.</p>
+                        <button onclick="window.close()">Close Window</button>
+                    </body>
+                </html>
+            `);
+            return;
+        }
+
+        // 4. Initialize Google OAuth2 client
+        const redirectUri = `https://${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
+        const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
+
+        logger.info(`OAuth redirect URI: ${redirectUri}`);
+
+        // 5. Exchange authorization code for tokens
+        const { tokens } = await oAuth2Client.getToken(code as string);
+        logger.info("Successfully exchanged authorization code for tokens", {
+            hasAccessToken: !!tokens.access_token,
+            hasRefreshToken: !!tokens.refresh_token,
+            expiryDate: tokens.expiry_date
+        });
+
+        // 6. Store tokens in Firestore
+        const appId = "my-voice-calendly-app";
+        const db = getFirestore();
+
+        const tokenData = {
+            access_token: tokens.access_token || null,
+            refresh_token: tokens.refresh_token || null, // Can be null if not first-time auth
+            expiry_date: tokens.expiry_date || null,
+            scopes: [
+                'https://www.googleapis.com/auth/calendar.events',
+                'https://www.googleapis.com/auth/userinfo.profile',
+                'https://www.googleapis.com/auth/userinfo.email'
+            ],
+            last_updated: FieldValue.serverTimestamp()
+        };
+
+        await db
+            .collection('artifacts')
+            .doc(appId)
+            .collection('users')
+            .doc(userId)
+            .collection('tokens')
+            .doc('googleCalendar')
+            .set(tokenData, { merge: true });
+
+        logger.info(`Successfully stored OAuth tokens for user: ${userId}`);
+
+        // 7. Send success response
+        res.status(200).send(`
+            <html>
+                <head>
+                    <title>Authorization Successful</title>
+                    <style>
+                        body { 
+                            font-family: Arial, sans-serif; 
+                            text-align: center; 
+                            padding: 50px; 
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            color: white;
+                            margin: 0;
+                        }
+                        .container {
+                            background: white;
+                            color: #333;
+                            padding: 40px;
+                            border-radius: 10px;
+                            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                            max-width: 500px;
+                            margin: 0 auto;
+                        }
+                        .success-icon {
+                            font-size: 48px;
+                            color: #4caf50;
+                            margin-bottom: 20px;
+                        }
+                        button {
+                            background: #4caf50;
+                            color: white;
+                            border: none;
+                            padding: 12px 24px;
+                            border-radius: 5px;
+                            cursor: pointer;
+                            font-size: 16px;
+                            margin-top: 20px;
+                        }
+                        button:hover {
+                            background: #45a049;
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="success-icon">✅</div>
+                        <h1>Authorization Successful!</h1>
+                        <p>Your Google Calendar has been successfully connected to the Voice Appointment System.</p>
+                        <p>You can now close this window and return to the app.</p>
+                        <button onclick="window.close()">Close Window</button>
+                    </div>
+                </body>
+            </html>
+        `);
+
+    } catch (error) {
+        logger.error("Error in OAuth callback:", error);
+
+        res.status(500).send(`
+            <html>
+                <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                    <h1 style="color: #d32f2f;">Authorization Error</h1>
+                    <p>An error occurred during the authorization process. Please try again.</p>
+                    <p style="color: #666; font-size: 14px;">Error: ${error instanceof Error ? error.message : 'Unknown error'}</p>
+                    <button onclick="window.close()">Close Window</button>
+                </body>
+            </html>
+        `);
     }
 }); 

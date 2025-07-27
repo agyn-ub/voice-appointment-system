@@ -1,19 +1,14 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Allow users to read/write their own appointments
-    match /users/{userId}/appointments/{appointmentId} {
-      allow read, write: if true; // For now, allowing all access - you should add proper auth later
+    // Allow users to access their own appointment data
+    match /users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
     }
     
-    // Allow users to read/write their own availability
-    match /users/{userId}/availability/{document} {
-      allow read, write: if true; // For now, allowing all access - you should add proper auth later
-    }
-    
-    // Deny access to all other documents
-    match /{document=**} {
-      allow read, write: if false;
+    // Allow authenticated users to access their OAuth tokens and artifacts
+    match /artifacts/{appId}/users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
     }
   }
 } 
