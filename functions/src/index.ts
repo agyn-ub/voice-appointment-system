@@ -24,10 +24,10 @@ const openaiApiKey = defineString("OPENAI_API_KEY");
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || openaiApiKey.value();
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 
-// Google OAuth configuration
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
-const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const REDIRECT_URI = `https://${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
+// Google OAuth configuration - hardcoded for testing
+const GOOGLE_CLIENT_ID = "73003602008-6g4n76290bt9mrtqkicr443mjjtm5qis.apps.googleusercontent.com";
+const GOOGLE_CLIENT_SECRET = "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";
+const REDIRECT_URI = `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
 
 // App ID for consistent document paths
 const APP_ID = "my-voice-calendly-app";
@@ -834,9 +834,13 @@ export const googleOAuthCallback = onRequest(async (req, res) => {
 
         logger.info(`Processing OAuth callback for authenticated user: ${userId}`);
 
-        // 3. Retrieve Google OAuth credentials from environment
-        const clientId = process.env.GOOGLE_CLIENT_ID;
-        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+        // 3. Retrieve Google OAuth credentials - hardcoded for testing
+        const clientId = "73003602008-6g4n76290bt9mrtqkicr443mjjtm5qis.apps.googleusercontent.com";
+        const clientSecret = "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";
+
+        // Debug logging - hardcoded credentials test
+        logger.info("Debug - hardcoded clientId:", clientId);
+        logger.info("Debug - hardcoded clientSecret:", clientSecret ? "***SET***" : "***NOT SET***");
 
         if (!clientId || !clientSecret) {
             logger.error("Google OAuth credentials not configured");
@@ -853,7 +857,7 @@ export const googleOAuthCallback = onRequest(async (req, res) => {
         }
 
         // 4. Initialize Google OAuth2 client
-        const redirectUri = `https://${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
+        const redirectUri = `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
         const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
 
         logger.info(`OAuth redirect URI: ${redirectUri}`);
@@ -882,68 +886,42 @@ export const googleOAuthCallback = onRequest(async (req, res) => {
             last_updated: FieldValue.serverTimestamp()
         };
 
-        await db
+        const tokenDocRef = db
             .collection('artifacts')
             .doc(appId)
             .collection('users')
             .doc(userId)
             .collection('tokens')
-            .doc('googleCalendar')
-            .set(tokenData, { merge: true });
+            .doc('googleCalendar');
+
+        logger.info(`Attempting to store tokens at path: ${tokenDocRef.path}`);
+
+        await tokenDocRef.set(tokenData, { merge: true });
+
+        // Verify the document was created
+        const verifyDoc = await tokenDocRef.get();
+        if (verifyDoc.exists) {
+            logger.info(`✅ Token document successfully created at: ${tokenDocRef.path}`);
+            logger.info(`Document data keys: ${Object.keys(verifyDoc.data() || {}).join(', ')}`);
+        } else {
+            logger.error(`❌ Token document was NOT created at: ${tokenDocRef.path}`);
+        }
 
         logger.info(`Successfully stored OAuth tokens for user: ${userId}`);
 
-        // 7. Send success response
-        res.status(200).send(`
+        // 7. Redirect to iOS app with success callback
+        const successUrl = `voicecalendly://oauth/success?userId=${userId}`;
+        logger.info(`Redirecting to iOS app: ${successUrl}`);
+
+        res.status(302).setHeader('Location', successUrl).send(`
             <html>
                 <head>
-                    <title>Authorization Successful</title>
-                    <style>
-                        body { 
-                            font-family: Arial, sans-serif; 
-                            text-align: center; 
-                            padding: 50px; 
-                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                            color: white;
-                            margin: 0;
-                        }
-                        .container {
-                            background: white;
-                            color: #333;
-                            padding: 40px;
-                            border-radius: 10px;
-                            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-                            max-width: 500px;
-                            margin: 0 auto;
-                        }
-                        .success-icon {
-                            font-size: 48px;
-                            color: #4caf50;
-                            margin-bottom: 20px;
-                        }
-                        button {
-                            background: #4caf50;
-                            color: white;
-                            border: none;
-                            padding: 12px 24px;
-                            border-radius: 5px;
-                            cursor: pointer;
-                            font-size: 16px;
-                            margin-top: 20px;
-                        }
-                        button:hover {
-                            background: #45a049;
-                        }
-                    </style>
+                    <title>Redirecting...</title>
+                    <meta http-equiv="refresh" content="0;url=${successUrl}">
                 </head>
                 <body>
-                    <div class="container">
-                        <div class="success-icon">✅</div>
-                        <h1>Authorization Successful!</h1>
-                        <p>Your Google Calendar has been successfully connected to the Voice Appointment System.</p>
-                        <p>You can now close this window and return to the app.</p>
-                        <button onclick="window.close()">Close Window</button>
-                    </div>
+                    <p>Authorization successful! Redirecting to app...</p>
+                    <p>If you're not redirected automatically, <a href="${successUrl}">click here</a>.</p>
                 </body>
             </html>
         `);
@@ -951,13 +929,19 @@ export const googleOAuthCallback = onRequest(async (req, res) => {
     } catch (error) {
         logger.error("Error in OAuth callback:", error);
 
-        res.status(500).send(`
+        // Extract userId from state if available
+        const userId = req.query.state as string || 'unknown';
+        const errorUrl = `voicecalendly://oauth/error?userId=${userId}&error=${encodeURIComponent(error instanceof Error ? error.message : 'Unknown error')}`;
+
+        res.status(302).setHeader('Location', errorUrl).send(`
             <html>
-                <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-                    <h1 style="color: #d32f2f;">Authorization Error</h1>
-                    <p>An error occurred during the authorization process. Please try again.</p>
-                    <p style="color: #666; font-size: 14px;">Error: ${error instanceof Error ? error.message : 'Unknown error'}</p>
-                    <button onclick="window.close()">Close Window</button>
+                <head>
+                    <title>Authorization Error</title>
+                    <meta http-equiv="refresh" content="0;url=${errorUrl}">
+                </head>
+                <body>
+                    <p>Authorization failed! Redirecting to app...</p>
+                    <p>If you're not redirected automatically, <a href="${errorUrl}">click here</a>.</p>
                 </body>
             </html>
         `);
