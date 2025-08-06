@@ -39,9 +39,6 @@ interface AppointmentData {
     time: string;
     duration?: number; // Optional to match iOS
     attendees?: string[]; // Optional to match iOS
-    meetingLink?: string | null;
-    location?: string | null; // Add location field for iOS
-    description?: string | null; // Add description field for iOS
     // Server-side only fields (not sent to client)
     timestamp?: Date;
     status?: string;
@@ -357,19 +354,22 @@ async function scheduleAppointment(userId: string, details: any, llmResponseMess
         title: appointmentTitle,
         date: details.date,
         time: details.time,
-        duration: details.duration || undefined, // Optional for iOS
-        attendees: details.attendees?.length > 0 ? details.attendees : undefined, // Optional for iOS
-        location: undefined, // Available for future use
-        description: undefined, // Available for future use
         // Server-side fields
         timestamp: appointmentDateTime,
         status: 'confirmed',
         createdAt: FieldValue.serverTimestamp()
     };
 
+    // Add optional fields only if they have values
+    if (details.duration) {
+        appointmentData.duration = details.duration;
+    }
+    if (details.attendees?.length > 0) {
+        appointmentData.attendees = details.attendees;
+    }
+
     // Google Calendar Integration
     let calendarSyncSuccess = false;
-    let meetingLink = null;
 
     try {
         const oAuth2Client = await getGoogleOAuth2Client(userId);
@@ -423,16 +423,11 @@ async function scheduleAppointment(userId: string, details: any, llmResponseMess
             requestBody: eventResource
         });
 
-        // Extract event ID and meeting link
+        // Extract event ID
         appointmentData.googleCalendarEventId = calendarResponse.data.id || null;
-        meetingLink = calendarResponse.data.hangoutLink || null;
         calendarSyncSuccess = true;
 
         logger.info(`Successfully created Google Calendar event: ${appointmentData.googleCalendarEventId}`);
-
-        if (meetingLink) {
-            appointmentData.meetingLink = meetingLink;
-        }
         appointmentData.calendarSynced = true;
 
     } catch (error) {
@@ -445,27 +440,29 @@ async function scheduleAppointment(userId: string, details: any, llmResponseMess
     const docRef = await customDb.collection('users').doc(userId).collection('appointments').add(appointmentData);
 
     // Update the document with its ID for iOS compatibility
-    const clientData = {
+    const clientData: any = {
         id: docRef.id,
         title: appointmentData.title,
         date: appointmentData.date,
-        time: appointmentData.time,
-        duration: appointmentData.duration,
-        attendees: appointmentData.attendees,
-        meetingLink: appointmentData.meetingLink,
-        location: appointmentData.location,
-        description: appointmentData.description
+        time: appointmentData.time
     };
+
+    // Add optional fields only if they exist
+    if (appointmentData.duration) {
+        clientData.duration = appointmentData.duration;
+    }
+    if (appointmentData.attendees) {
+        clientData.attendees = appointmentData.attendees;
+    }
 
     // Update document with client-compatible data
     await docRef.update(clientData);
 
     // Return response based on calendar sync status
     if (calendarSyncSuccess) {
-        const meetingInfo = meetingLink ? ` A Google Meet link has been created.` : '';
         return {
             success: true,
-            message: llmResponseMessage || `Appointment "${appointmentTitle}" scheduled successfully and synced with Google Calendar.${meetingInfo}`,
+            message: llmResponseMessage || `Appointment "${appointmentTitle}" scheduled successfully and synced with Google Calendar.`,
             intent: 'schedule_appointment',
             details: details
         };
@@ -699,26 +696,30 @@ async function getAppointments(userId: string, details: any, llmResponseMessage:
     const appointments: any[] = [];
     appointmentsQuery.forEach(doc => {
         const appointmentData = doc.data();
-        // Return only iOS-compatible fields
-        appointments.push({
+        // Return only basic fields
+        const appointment: any = {
             id: appointmentData.id || doc.id, // Use stored id or fallback to document id
             title: appointmentData.title,
             date: appointmentData.date,
-            time: appointmentData.time,
-            duration: appointmentData.duration || null,
-            attendees: appointmentData.attendees || null,
-            meetingLink: appointmentData.meetingLink || null,
-            location: appointmentData.location || null,
-            description: appointmentData.description || null
-        });
+            time: appointmentData.time
+        };
+
+        // Add optional fields only if they exist
+        if (appointmentData.duration) {
+            appointment.duration = appointmentData.duration;
+        }
+        if (appointmentData.attendees) {
+            appointment.attendees = appointmentData.attendees;
+        }
+
+        appointments.push(appointment);
     });
 
     if (appointments.length > 0) {
         const appointmentsSummary = appointments.map(apt => {
-            const meetingInfo = apt.meetingLink ? ` (Google Meet available)` : '';
             const attendeesText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
             const durationText = apt.duration ? ` (${apt.duration} minutes)` : '';
-            return `${apt.title} on ${apt.date} at ${apt.time}${durationText}${attendeesText}${meetingInfo}`;
+            return `${apt.title} on ${apt.date} at ${apt.time}${durationText}${attendeesText}`;
         }).join('; ');
 
         return {
