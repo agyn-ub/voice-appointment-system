@@ -5,7 +5,7 @@
 
 import { onCall } from "firebase-functions/v2/https";
 import { onRequest } from "firebase-functions/v2/https";
-import { beforeUserCreated } from "firebase-functions/v2/identity";
+import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import { google } from "googleapis";
 
@@ -20,11 +20,11 @@ initializeApp();
 const customDb = getFirestore();
 
 // OpenAI API configuration
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_API_KEY2 = defineSecret("OPENAI_API_KEY2");
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 
 // Google OAuth configuration - hardcoded for testing
-const GOOGLE_CLIENT_ID = "73003602008-6g4n76290bt9mrtqkicr443mjjtm5qis.apps.googleusercontent.com";
+const GOOGLE_CLIENT_ID = "73003602008-0jgk8u5h4s4pdu3010utqovs0kb14fgb.apps.googleusercontent.com";
 const GOOGLE_CLIENT_SECRET = "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";
 const REDIRECT_URI = `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
 
@@ -33,16 +33,20 @@ const APP_ID = "my-voice-calendly-app";
 
 // Define TypeScript interfaces for our data structures
 interface AppointmentData {
+    id?: string; // Document ID - will be set after creation
     title: string;
     date: string;
     time: string;
-    duration: number;
-    attendees: string[];
-    timestamp: Date;
-    status: string;
-    createdAt: FieldValue;
-    googleCalendarEventId?: string | null;
+    duration?: number; // Optional to match iOS
+    attendees?: string[]; // Optional to match iOS
     meetingLink?: string | null;
+    location?: string | null; // Add location field for iOS
+    description?: string | null; // Add description field for iOS
+    // Server-side only fields (not sent to client)
+    timestamp?: Date;
+    status?: string;
+    createdAt?: FieldValue;
+    googleCalendarEventId?: string | null;
     calendarSynced?: boolean;
     calendarSyncError?: string;
 }
@@ -275,7 +279,7 @@ async function processCommandWithAI(command: string): Promise<any> {
        Details: {} // Empty object
     `;
 
-    if (!OPENAI_API_KEY) {
+    if (!OPENAI_API_KEY2.value()) {
         logger.error("OpenAI API key not configured");
         throw new Error('OpenAI API key not configured.');
     }
@@ -296,7 +300,7 @@ async function processCommandWithAI(command: string): Promise<any> {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${OPENAI_API_KEY}`
+                'Authorization': `Bearer ${OPENAI_API_KEY2.value()}`
             },
             body: JSON.stringify(llmRequestPayload)
         });
@@ -348,13 +352,16 @@ async function scheduleAppointment(userId: string, details: any, llmResponseMess
         throw new Error('AI provided an invalid date or time format.');
     }
 
-    // Create appointment data
+    // Create appointment data - iOS-compatible format
     const appointmentData: AppointmentData = {
         title: appointmentTitle,
         date: details.date,
         time: details.time,
-        duration: details.duration,
-        attendees: details.attendees || [],
+        duration: details.duration || undefined, // Optional for iOS
+        attendees: details.attendees?.length > 0 ? details.attendees : undefined, // Optional for iOS
+        location: undefined, // Available for future use
+        description: undefined, // Available for future use
+        // Server-side fields
         timestamp: appointmentDateTime,
         status: 'confirmed',
         createdAt: FieldValue.serverTimestamp()
@@ -435,7 +442,23 @@ async function scheduleAppointment(userId: string, details: any, llmResponseMess
     }
 
     // Save appointment to Firestore
-    await customDb.collection('users').doc(userId).collection('appointments').add(appointmentData);
+    const docRef = await customDb.collection('users').doc(userId).collection('appointments').add(appointmentData);
+
+    // Update the document with its ID for iOS compatibility
+    const clientData = {
+        id: docRef.id,
+        title: appointmentData.title,
+        date: appointmentData.date,
+        time: appointmentData.time,
+        duration: appointmentData.duration,
+        attendees: appointmentData.attendees,
+        meetingLink: appointmentData.meetingLink,
+        location: appointmentData.location,
+        description: appointmentData.description
+    };
+
+    // Update document with client-compatible data
+    await docRef.update(clientData);
 
     // Return response based on calendar sync status
     if (calendarSyncSuccess) {
@@ -676,24 +699,26 @@ async function getAppointments(userId: string, details: any, llmResponseMessage:
     const appointments: any[] = [];
     appointmentsQuery.forEach(doc => {
         const appointmentData = doc.data();
+        // Return only iOS-compatible fields
         appointments.push({
-            id: doc.id,
+            id: appointmentData.id || doc.id, // Use stored id or fallback to document id
             title: appointmentData.title,
             date: appointmentData.date,
             time: appointmentData.time,
-            duration: appointmentData.duration,
-            attendees: appointmentData.attendees || [],
-            status: appointmentData.status,
+            duration: appointmentData.duration || null,
+            attendees: appointmentData.attendees || null,
             meetingLink: appointmentData.meetingLink || null,
-            googleCalendarEventId: appointmentData.googleCalendarEventId || null,
-            calendarSynced: appointmentData.calendarSynced || false
+            location: appointmentData.location || null,
+            description: appointmentData.description || null
         });
     });
 
     if (appointments.length > 0) {
         const appointmentsSummary = appointments.map(apt => {
             const meetingInfo = apt.meetingLink ? ` (Google Meet available)` : '';
-            return `${apt.title} on ${apt.date} at ${apt.time} (${apt.duration} minutes)${apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : ''}${meetingInfo}`;
+            const attendeesText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
+            const durationText = apt.duration ? ` (${apt.duration} minutes)` : '';
+            return `${apt.title} on ${apt.date} at ${apt.time}${durationText}${attendeesText}${meetingInfo}`;
         }).join('; ');
 
         return {
@@ -701,11 +726,7 @@ async function getAppointments(userId: string, details: any, llmResponseMessage:
             message: llmResponseMessage || `You have ${appointments.length} appointment(s): ${appointmentsSummary}`,
             intent: 'get_appointments',
             details: details,
-            appointments: appointments.map(apt => ({
-                ...apt,
-                meetingLink: apt.meetingLink || null,
-                calendarSynced: apt.calendarSynced || false
-            }))
+            appointments: appointments // Already contains only iOS-compatible fields
         };
     } else {
         return {
@@ -722,7 +743,7 @@ async function getAppointments(userId: string, details: any, llmResponseMessage:
  * Process voice command using AI and perform scheduling operations
  * This is a Callable function that can be called directly from client apps
  */
-export const processVoiceCommand = onCall(async (request) => {
+export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async (request) => {
     const { data, auth } = request;
 
     // --- FIREBASE AUTHENTICATION ---
@@ -826,7 +847,7 @@ export const googleOAuthCallback = onRequest(async (req, res) => {
         await createUserIfNotExists(userId);
 
         // 3. Retrieve Google OAuth credentials - hardcoded for testing
-        const clientId = "73003602008-6g4n76290bt9mrtqkicr443mjjtm5qis.apps.googleusercontent.com";
+        const clientId = "73003602008-0jgk8u5h4s4pdu3010utqovs0kb14fgb.apps.googleusercontent.com";
         const clientSecret = "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";
 
         // Debug logging - hardcoded credentials test
@@ -1020,52 +1041,8 @@ export const connectGoogleCalendar = onCall(async (request) => {
     }
 });
 
-/**
- * Firebase Auth Blocking Function - Capture Google OAuth Credentials
- * This function runs when a user signs in with Google and captures their OAuth credentials
- */
-export const beforeUserCreate = beforeUserCreated(async (event) => {
-    const { data: user } = event;
-
-    try {
-        if (!user) {
-            logger.error('No user data in beforeUserCreate event');
-            return { customClaims: {} };
-        }
-
-        const userId = user.uid;
-        const providerData = user.providerData;
-
-        // Check if user is signing in with Google
-        const googleProvider = providerData.find(provider => provider.providerId === 'google.com');
-
-        if (googleProvider) {
-            logger.info(`Google Sign-In detected for user: ${userId}`);
-
-            // Create user document with Google provider info
-            await customDb.collection('users').doc(userId).set({
-                userId: userId,
-                email: user.email,
-                displayName: user.displayName,
-                photoURL: user.photoURL,
-                authProvider: 'google',
-                createdAt: FieldValue.serverTimestamp(),
-                lastLogin: FieldValue.serverTimestamp(),
-                status: 'active'
-            }, { merge: true });
-
-            logger.info(`✅ User document created for Google Sign-In user: ${userId}`);
-        }
-
-        // Don't block the sign-in process
-        return { customClaims: {} };
-
-    } catch (error) {
-        logger.error('Error in beforeUserCreate:', error);
-        // Don't block sign-in on error
-        return { customClaims: {} };
-    }
-});
+// Removed beforeUserCreate blocking function - requires GCIP (Google Cloud Identity Platform)
+// User documents are now created manually in other functions when needed
 
 /**
  * Save user refresh token for offline access
@@ -1095,66 +1072,50 @@ async function saveUserRefreshToken(userId: string, refreshToken: string, provid
     }
 }
 
-/**
- * Set up Google Calendar integration for new user
- */
-async function setupGoogleCalendarIntegration(userId: string, accessToken: string, refreshToken: string) {
-    try {
-        // Initialize OAuth2 client
-        const oAuth2Client = new google.auth.OAuth2(
-            GOOGLE_CLIENT_ID,
-            GOOGLE_CLIENT_SECRET,
-            REDIRECT_URI
-        );
-
-        // Set credentials
-        oAuth2Client.setCredentials({
-            access_token: accessToken,
-            refresh_token: refreshToken
-        });
-
-        // Test calendar access
-        const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
-
-        // Try to list calendars to verify access
-        await calendar.calendarList.list();
-
-        // Update user document with calendar connection status
-        await customDb.collection('users').doc(userId).update({
-            calendarConnected: true,
-            calendarConnectedAt: FieldValue.serverTimestamp(),
-            lastCalendarSync: FieldValue.serverTimestamp(),
-            authProvider: 'google'
-        });
-
-        logger.info(`✅ Calendar integration verified for user: ${userId}`);
-
-    } catch (error) {
-        logger.error(`Error setting up calendar integration for user ${userId}:`, error);
-    }
-}
+// Removed unused setupGoogleCalendarIntegration function
 
 // Enhanced function to check if a user already has valid tokens
 export const checkGoogleCalendarAuth = onCall(async (request) => {
     const { auth } = request;
 
-    // Validate user authentication
-    const userId = validateUserAuth(auth);
-    logger.info(`Checking Google Calendar auth status for user: ${userId}`);
-
-    // Verify the user exists and has Google account
-    const userDoc = await customDb.collection('users').doc(userId).get();
-
-    if (!userDoc.exists) {
-        throw new Error('User not found. Please sign in first.');
-    }
-
-    const userData = userDoc.data();
-    if (userData?.authProvider !== 'google') {
-        throw new Error('Google Calendar connection requires Google Sign-In');
-    }
-
     try {
+        // Validate user authentication
+        if (!auth) {
+            logger.error('checkGoogleCalendarAuth: No authentication provided');
+            return {
+                isAuthenticated: false,
+                error: 'User must be authenticated',
+                message: 'Please sign in first'
+            };
+        }
+
+        const userId = auth.uid;
+        logger.info(`Checking Google Calendar auth status for user: ${userId}`);
+
+        // Verify the user exists and has Google account
+        const userDoc = await customDb.collection('users').doc(userId).get();
+
+        if (!userDoc.exists) {
+            logger.info(`User document not found for user: ${userId}`);
+            return {
+                isAuthenticated: false,
+                error: 'User not found',
+                message: 'Please sign in first',
+                needsReauth: true
+            };
+        }
+
+        const userData = userDoc.data();
+        if (userData?.authProvider !== 'google') {
+            logger.info(`User ${userId} is not signed in with Google. Auth provider: ${userData?.authProvider}`);
+            return {
+                isAuthenticated: false,
+                error: 'Google Calendar connection requires Google Sign-In',
+                message: 'Please sign in with Google to connect calendar',
+                needsReauth: true
+            };
+        }
+
         // Check if tokens exist in Firestore
         const tokenDoc = await customDb
             .collection('artifacts')
@@ -1262,8 +1223,15 @@ export const checkGoogleCalendarAuth = onCall(async (request) => {
             };
         }
     } catch (error) {
-        logger.error(`Error checking Google Calendar auth for user ${userId}:`, error);
-        throw new Error(`Failed to check Google Calendar authentication: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        logger.error(`Error checking Google Calendar auth for user ${auth?.uid || 'unknown'}:`, error);
+
+        return {
+            isAuthenticated: false,
+            error: errorMessage,
+            message: `Failed to check Google Calendar authentication: ${errorMessage}`,
+            needsReauth: true
+        };
     }
 });
 
@@ -1272,7 +1240,7 @@ export const checkGoogleCalendarAuth = onCall(async (request) => {
  * Handles Google Sign-In with calendar access and creates/updates user in Firestore
  */
 export const googleSignIn = onCall(async (request) => {
-    const { data, auth } = request;
+    const { data } = request;
     const { googleIdToken, accessToken, refreshToken } = data;
 
     try {
@@ -1413,7 +1381,7 @@ export const refreshGoogleTokens = onCall(async (request) => {
 
         // Try to refresh tokens
         try {
-            const oAuth2Client = await getGoogleOAuth2Client(userId);
+            await getGoogleOAuth2Client(userId);
 
             // The getGoogleOAuth2Client function already handles token refresh
             // If we get here, tokens are valid
@@ -1442,61 +1410,126 @@ export const refreshGoogleTokens = onCall(async (request) => {
 
 /**
  * Store Google Calendar Authentication Tokens
- * Securely stores access tokens and refresh tokens with encryption
+ * Securely stores access tokens and refresh tokens with proper validation
  */
 export const storeGoogleCalendarAuth = onCall(async (request) => {
     const { data, auth } = request;
-    const { accessToken, refreshToken, expiryDate, scopes } = data;
 
     try {
         // Validate user authentication
         if (!auth) {
+            logger.error('storeGoogleCalendarAuth: No authentication provided');
             throw new Error('User must be authenticated');
         }
 
         const userId = auth.uid;
+        logger.info(`Storing Google Calendar tokens for user: ${userId}`);
+        logger.info(`Received data keys: ${Object.keys(data || {}).join(', ')}`);
 
-        // Verify the user exists and has Google account
+        // Extract and validate required parameters
+        const {
+            accessToken,
+            refreshToken,
+            expiryDate,
+            scopes,
+            name,
+            email
+        } = data || {};
+
+        // Enhanced validation with specific error messages
+        if (!accessToken) {
+            logger.error('storeGoogleCalendarAuth: Missing accessToken');
+            throw new Error('Access token is required for calendar integration');
+        }
+
+        if (!refreshToken) {
+            logger.error('storeGoogleCalendarAuth: Missing refreshToken');
+            throw new Error('Refresh token is required for offline access');
+        }
+
+        if (!email) {
+            logger.error('storeGoogleCalendarAuth: Missing email');
+            throw new Error('Email is required for user identification');
+        }
+
+        // Create or update user document with provided data
         const userDoc = await customDb.collection('users').doc(userId).get();
 
         if (!userDoc.exists) {
-            throw new Error('User not found. Please sign in first.');
+            // Create user document with provided information
+            const newUserData = {
+                userId: userId,
+                email: email,
+                name: name || 'Unknown',
+                authProvider: 'google',
+                createdAt: FieldValue.serverTimestamp(),
+                lastLogin: FieldValue.serverTimestamp(),
+                status: 'active'
+            };
+
+            await customDb.collection('users').doc(userId).set(newUserData);
+            logger.info(`Created new user document for: ${userId}`);
+        } else {
+            // Update existing user document
+            const updateData: any = {
+                email: email,
+                lastLogin: FieldValue.serverTimestamp()
+            };
+
+            if (name) {
+                updateData.name = name;
+            }
+
+            // Only update authProvider if not already set or if it's different
+            const userData = userDoc.data();
+            if (!userData?.authProvider || userData.authProvider !== 'google') {
+                updateData.authProvider = 'google';
+            }
+
+            await customDb.collection('users').doc(userId).update(updateData);
+            logger.info(`Updated existing user document for: ${userId}`);
         }
 
-        const userData = userDoc.data();
-        if (userData?.authProvider !== 'google') {
-            throw new Error('Google Calendar storage requires Google Sign-In');
-        }
-
-        // Validate required tokens
-        if (!accessToken || !refreshToken) {
-            throw new Error('Access token and refresh token are required');
-        }
-
-        // Validate token expiration
+        // Process token expiration
         const now = Date.now();
-        const tokenExpiry = expiryDate ? new Date(expiryDate).getTime() : null;
+        let tokenExpiry: number | null = null;
+
+        if (expiryDate) {
+            // Handle different expiry date formats
+            if (typeof expiryDate === 'number') {
+                tokenExpiry = expiryDate;
+            } else if (typeof expiryDate === 'string') {
+                tokenExpiry = new Date(expiryDate).getTime();
+            }
+
+            if (tokenExpiry && isNaN(tokenExpiry)) {
+                logger.warn(`Invalid expiry date format: ${expiryDate}, using current time + 1 hour`);
+                tokenExpiry = now + (60 * 60 * 1000); // 1 hour from now
+            }
+        } else {
+            // Default to 1 hour if no expiry provided
+            tokenExpiry = now + (60 * 60 * 1000);
+            logger.info('No expiry date provided, defaulting to 1 hour from now');
+        }
 
         if (tokenExpiry && tokenExpiry <= now) {
-            throw new Error('Access token has already expired');
+            logger.warn(`Access token has already expired (${new Date(tokenExpiry).toISOString()}), but proceeding with storage for refresh token use`);
         }
 
-        logger.info(`Storing Google Calendar tokens for user: ${userId}`);
-
-        // Prepare token data with encryption indicators
+        // Prepare token data
         const tokenData = {
             access_token: accessToken,
             refresh_token: refreshToken,
             expiry_date: tokenExpiry,
             scopes: scopes || [
                 'https://www.googleapis.com/auth/calendar.events',
-                'https://www.googleapis.com/auth/userinfo.profile',
-                'https://www.googleapis.com/auth/userinfo.email'
+                'https://www.googleapis.com/auth/calendar.readonly',
+                'https://www.googleapis.com/auth/calendar'
             ],
             last_updated: FieldValue.serverTimestamp(),
-            user_id: userId, // Associate with user ID
+            user_id: userId,
             auth_provider: 'google',
-            token_version: '1.0', // For future token format updates
+            token_version: '1.1', // Updated version
             is_encrypted: false // Firebase automatically encrypts at rest
         };
 
@@ -1509,13 +1542,18 @@ export const storeGoogleCalendarAuth = onCall(async (request) => {
             .collection('tokens')
             .doc('googleCalendar');
 
+        logger.info(`Storing tokens at path: ${tokenDocRef.path}`);
         await tokenDocRef.set(tokenData, { merge: true });
 
         // Verify the document was created
         const verifyDoc = await tokenDocRef.get();
         if (!verifyDoc.exists) {
-            throw new Error('Failed to store tokens in Firestore');
+            logger.error('Failed to create token document after set operation');
+            throw new Error('Failed to store tokens in Firestore - document not created');
         }
+
+        const storedData = verifyDoc.data();
+        logger.info(`✅ Token document created successfully. Keys: ${Object.keys(storedData || {}).join(', ')}`);
 
         // Update user document with calendar connection status
         await customDb.collection('users').doc(userId).update({
@@ -1525,19 +1563,27 @@ export const storeGoogleCalendarAuth = onCall(async (request) => {
         });
 
         logger.info(`✅ Successfully stored Google Calendar tokens for user: ${userId}`);
-        logger.info(`Token document path: ${tokenDocRef.path}`);
 
         return {
             success: true,
             message: "Google Calendar tokens stored successfully",
             userId: userId,
             tokenStored: true,
-            expiryDate: tokenExpiry
+            expiryDate: tokenExpiry,
+            tokenPath: tokenDocRef.path
         };
 
     } catch (error) {
-        logger.error(`Error storing Google Calendar tokens for user ${auth?.uid}:`, error);
-        throw new Error(`Failed to store Google Calendar tokens: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+        logger.error(`❌ Error storing Google Calendar tokens for user ${auth?.uid || 'unknown'}:`, error);
+
+        // Return a structured error response instead of throwing
+        return {
+            success: false,
+            message: `Failed to store Google Calendar tokens: ${errorMessage}`,
+            error: errorMessage,
+            userId: auth?.uid || null
+        };
     }
 });
 
@@ -1565,4 +1611,48 @@ async function createUserIfNotExists(userId: string) {
     } catch (error) {
         logger.error(`Error creating/updating user document for ${userId}:`, error);
     }
-} 
+}
+
+/**
+ * Simple test function to verify OpenAI API key is working
+ * This function doesn't require authentication for easy testing
+ */
+export const testOpenAI = onRequest({ secrets: [OPENAI_API_KEY2] }, async (req, res) => {
+    try {
+        logger.info("Testing OpenAI API connection...");
+
+        if (!OPENAI_API_KEY2.value()) {
+            logger.error("OpenAI API key not configured");
+            res.status(500).json({ error: "API key not configured" });
+            return;
+        }
+
+        const testResponse = await fetch(OPENAI_API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${OPENAI_API_KEY2.value()}`
+            },
+            body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [{ role: "user", content: "Hello, this is a test" }],
+                max_tokens: 10
+            })
+        });
+
+        if (!testResponse.ok) {
+            const errorBody = await testResponse.text();
+            logger.error(`OpenAI API error: ${testResponse.status}, body: ${errorBody}`);
+            res.status(500).json({ error: "OpenAI API failed", details: errorBody });
+            return;
+        }
+
+        const result = await testResponse.json();
+        logger.info("OpenAI API test successful!");
+        res.json({ success: true, message: "OpenAI API key is working!", result: result });
+
+    } catch (error) {
+        logger.error("Error testing OpenAI API:", error);
+        res.status(500).json({ error: "Test failed", details: error instanceof Error ? error.message : String(error) });
+    }
+}); 
