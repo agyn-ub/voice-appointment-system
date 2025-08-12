@@ -266,3 +266,4 @@ For support and questions:
 ---
 
 **Built with ❤️ using Firebase Functions and OpenAI** 
+

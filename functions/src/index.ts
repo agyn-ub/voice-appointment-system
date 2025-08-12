@@ -328,7 +328,7 @@ async function processCommandWithAI(command: string): Promise<any> {
 /**
  * Schedule a new appointment
  */
-async function scheduleAppointment(userId: string, details: any, llmResponseMessage: string): Promise<any> {
+async function scheduleAppointment(userId: string, details: any, llmResponseMessage: string, userTimezone: string = 'America/Los_Angeles'): Promise<any> {
     // Validate required fields
     if (!details.date || !details.time || typeof details.duration !== 'number') {
         throw new Error('Missing or invalid details for scheduling an appointment.');
@@ -391,11 +391,11 @@ async function scheduleAppointment(userId: string, details: any, llmResponseMess
             description: `Appointment created via Voice Command System`,
             start: {
                 dateTime: appointmentDateTime.toISOString(),
-                timeZone: 'America/Los_Angeles',
+                timeZone: userTimezone,
             },
             end: {
                 dateTime: endDateTime.toISOString(),
-                timeZone: 'America/Los_Angeles',
+                timeZone: userTimezone,
             },
             attendees: calendarAttendees,
             reminders: {
@@ -752,7 +752,8 @@ export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async 
     logger.info(`Processing command for authenticated user: ${userId}`);
 
     const userCommandText = validateCommand(data.command);
-    logger.info(`Processing command for user ${userId}: "${userCommandText}"`);
+    const userTimezone = data.timezone || 'America/Los_Angeles'; // Default fallback
+    logger.info(`Processing command for user ${userId}: "${userCommandText}" in timezone: ${userTimezone}`);
 
     try {
         // --- AI PROCESSING ---
@@ -764,7 +765,7 @@ export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async 
         // --- INTENT-BASED DISPATCH ---
         switch (intent) {
             case "schedule_appointment":
-                return await scheduleAppointment(userId, details, llm_response_message);
+                return await scheduleAppointment(userId, details, llm_response_message, userTimezone);
 
             case "set_availability":
                 return await setAvailability(userId, details, llm_response_message);
