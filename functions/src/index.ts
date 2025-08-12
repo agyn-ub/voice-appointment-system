@@ -334,13 +334,34 @@ async function scheduleAppointment(userId: string, details: any, llmResponseMess
         throw new Error('Missing or invalid details for scheduling an appointment.');
     }
 
-    // Generate default title if none provided
+    // Generate default title if none provided - handle null/undefined/empty cases
     let appointmentTitle = details.title;
-    if (!appointmentTitle || appointmentTitle.trim() === '') {
-        const attendeesText = details.attendees && details.attendees.length > 0
-            ? ` with ${details.attendees.join(', ')}`
-            : '';
-        appointmentTitle = `Meeting${attendeesText}`;
+    if (!appointmentTitle || typeof appointmentTitle !== 'string' || appointmentTitle.trim() === '') {
+        // Create a meaningful default title based on available information
+        let defaultTitle = 'Appointment';
+        
+        if (details.attendees && Array.isArray(details.attendees) && details.attendees.length > 0) {
+            // Filter out empty/invalid attendees
+            const validAttendees = details.attendees.filter((attendee: any) => 
+                attendee && typeof attendee === 'string' && attendee.trim() !== ''
+            );
+            
+            if (validAttendees.length > 0) {
+                if (validAttendees.length === 1) {
+                    defaultTitle = `Meeting with ${validAttendees[0]}`;
+                } else if (validAttendees.length === 2) {
+                    defaultTitle = `Meeting with ${validAttendees.join(' and ')}`;
+                } else {
+                    defaultTitle = `Meeting with ${validAttendees[0]} and ${validAttendees.length - 1} others`;
+                }
+            }
+        } else {
+            // No attendees, just use time-based description
+            const timeFormatted = details.time || 'scheduled time';
+            defaultTitle = `Appointment at ${timeFormatted}`;
+        }
+        
+        appointmentTitle = defaultTitle;
     }
 
     // Convert date and time to Date object
@@ -498,8 +519,18 @@ async function setAvailability(userId: string, details: any, llmResponseMessage:
  * Cancel appointments
  */
 async function cancelAppointments(userId: string, details: any): Promise<any> {
-    if (!details.date || (!details.title && (!details.attendees || details.attendees.length === 0))) {
-        throw new Error('Missing or invalid details for cancelling an appointment. Need either a title or attendees to identify the appointment.');
+    if (!details.date) {
+        throw new Error('Date is required to cancel an appointment.');
+    }
+    
+    // Allow cancellation by title, attendees, or time - at least one must be provided
+    const hasTitle = details.title && typeof details.title === 'string' && details.title.trim() !== '';
+    const hasAttendees = details.attendees && Array.isArray(details.attendees) && 
+                        details.attendees.some((attendee: any) => attendee && typeof attendee === 'string' && attendee.trim() !== '');
+    const hasTime = details.time && typeof details.time === 'string' && details.time.trim() !== '';
+    
+    if (!hasTitle && !hasAttendees && !hasTime) {
+        throw new Error('Need at least a title, attendees, or specific time to identify the appointment to cancel.');
     }
 
     // Query Firestore to find appointments to cancel
@@ -520,39 +551,53 @@ async function cancelAppointments(userId: string, details: any): Promise<any> {
             try {
                 const appointmentData = docSnap.data();
 
-                if (!appointmentData || !appointmentData.title) {
-                    logger.warn("Skipping appointment with invalid data:", docSnap.id);
+                if (!appointmentData) {
+                    logger.warn("Skipping appointment with no data:", docSnap.id);
                     return;
                 }
+                
+                // Handle appointments that may not have titles
+                const appointmentTitle = appointmentData.title || `Appointment at ${appointmentData.time || 'unknown time'}`;
 
                 availableAppointments.push({
                     id: docSnap.id,
-                    title: appointmentData.title,
+                    title: appointmentTitle, // Use the fallback title
+                    originalTitle: appointmentData.title, // Keep original for matching
                     time: appointmentData.time || '',
                     attendees: appointmentData.attendees || [],
                     googleCalendarEventId: appointmentData.googleCalendarEventId || null
                 });
 
-                // Smart matching logic
-                const titleMatch = appointmentData.title &&
-                    appointmentData.title.toLowerCase().includes(details.title.toLowerCase());
+                // Smart matching logic - handle missing titles gracefully
+                let titleMatch = false;
+                if (hasTitle && appointmentData.title) {
+                    titleMatch = appointmentData.title.toLowerCase().includes(details.title.toLowerCase());
+                }
 
-                const timeMatch = details.time && appointmentData.time === details.time;
+                let timeMatch = false;
+                if (hasTime && appointmentData.time) {
+                    timeMatch = appointmentData.time === details.time;
+                }
 
-                const attendeeMatch = details.attendees && details.attendees.length > 0 &&
-                    appointmentData.attendees && appointmentData.attendees.some((attendee: string) =>
-                        details.attendees.some((searchAttendee: string) =>
-                            attendee.toLowerCase().includes(searchAttendee.toLowerCase())
+                let attendeeMatch = false;
+                if (hasAttendees && appointmentData.attendees && Array.isArray(appointmentData.attendees)) {
+                    attendeeMatch = appointmentData.attendees.some((attendee: string) =>
+                        attendee && details.attendees.some((searchAttendee: string) =>
+                            searchAttendee && attendee.toLowerCase().includes(searchAttendee.toLowerCase())
                         )
                     );
+                }
 
                 let fuzzyMatch = false;
                 try {
-                    if (appointmentData.title && details.title) {
-                        fuzzyMatch = appointmentData.title.toLowerCase().includes(details.title.toLowerCase()) ||
-                            details.title.toLowerCase().includes(appointmentData.title.toLowerCase()) ||
-                            appointmentData.title.toLowerCase().split(' ').some((word: string) =>
-                                details.title.toLowerCase().includes(word)
+                    if (hasTitle && appointmentData.title) {
+                        const searchTitle = details.title.toLowerCase();
+                        const appointmentTitleLower = appointmentData.title.toLowerCase();
+                        
+                        fuzzyMatch = appointmentTitleLower.includes(searchTitle) ||
+                            searchTitle.includes(appointmentTitleLower) ||
+                            appointmentTitleLower.split(' ').some((word: string) =>
+                                searchTitle.includes(word) && word.length > 2
                             );
                     }
                 } catch (error) {
@@ -614,16 +659,21 @@ async function cancelAppointments(userId: string, details: any): Promise<any> {
             }
         } else {
             // No exact matches found - provide smart suggestions
-            if (details.title) {
+            if (hasTitle) {
                 availableAppointments.forEach(apt => {
                     try {
-                        const similarity = calculateSimilarity(details.title.toLowerCase(), apt.title.toLowerCase());
-                        if (similarity > 0.3) {
-                            suggestedMatches.push(`${apt.title} at ${apt.time}${apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : ''}`);
+                        const titleToMatch = apt.originalTitle || apt.title || '';
+                        if (titleToMatch) {
+                            const similarity = calculateSimilarity(details.title.toLowerCase(), titleToMatch.toLowerCase());
+                            if (similarity > 0.3) {
+                                const attendeeText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
+                                suggestedMatches.push(`${apt.title} at ${apt.time}${attendeeText}`);
+                            }
                         }
                     } catch (error) {
                         logger.error("Error calculating similarity for appointment:", apt.title, error);
-                        suggestedMatches.push(`${apt.title} at ${apt.time}${apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : ''}`);
+                        const attendeeText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
+                        suggestedMatches.push(`${apt.title} at ${apt.time}${attendeeText}`);
                     }
                 });
             }
@@ -632,35 +682,79 @@ async function cancelAppointments(userId: string, details: any): Promise<any> {
 
     if (cancelledCount > 0) {
         const countText = cancelledCount === 1 ? "appointment" : "appointments";
-        const safeTitle = details.title || "appointment";
+        
+        // Create a meaningful description of what was cancelled
+        let cancelDescription = '';
+        if (hasTitle) {
+            cancelDescription = `"${details.title}"`;
+        } else if (hasTime) {
+            cancelDescription = `at ${details.time}`;
+        } else if (hasAttendees) {
+            const validAttendees = details.attendees.filter((attendee: any) => 
+                attendee && typeof attendee === 'string' && attendee.trim() !== ''
+            );
+            cancelDescription = `with ${validAttendees.join(', ')}`;
+        } else {
+            cancelDescription = 'the specified appointment';
+        }
+        
         return {
             success: true,
-            message: `Successfully cancelled ${cancelledCount} ${countText} matching "${safeTitle}" on ${details.date}.`,
+            message: `Successfully cancelled ${cancelledCount} ${countText} ${cancelDescription} on ${details.date}.`,
             intent: 'cancel_appointment',
             details: details
         };
     } else {
         if (suggestedMatches.length > 0) {
-            const safeTitle = details.title || "appointment";
+            // Use the same description logic for failed matches
+            let searchDescription = '';
+            if (hasTitle) {
+                searchDescription = `"${details.title}"`;
+            } else if (hasTime) {
+                searchDescription = `at ${details.time}`;
+            } else if (hasAttendees) {
+                const validAttendees = details.attendees.filter((attendee: any) => 
+                    attendee && typeof attendee === 'string' && attendee.trim() !== ''
+                );
+                searchDescription = `with ${validAttendees.join(', ')}`;
+            } else {
+                searchDescription = 'the specified criteria';
+            }
+            
             return {
                 success: false,
-                message: `No exact match found for "${safeTitle}". Did you mean one of these? ${suggestedMatches.join(', ')}`,
+                message: `No exact match found for ${searchDescription}. Did you mean one of these? ${suggestedMatches.join(', ')}`,
                 intent: 'cancel_appointment',
                 details: details
             };
         } else if (availableAppointments.length > 0) {
             const appointmentList = availableAppointments.map(apt => {
                 try {
-                    return `${apt.title} at ${apt.time}${apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : ''}`;
+                    const attendeeText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
+                    return `${apt.title || 'Untitled appointment'} at ${apt.time || 'unknown time'}${attendeeText}`;
                 } catch (error) {
                     logger.error("Error formatting appointment:", apt, error);
-                    return `${apt.title || 'Unknown'} at ${apt.time || 'unknown time'}`;
+                    return `${apt.title || 'Unknown appointment'} at ${apt.time || 'unknown time'}`;
                 }
             }).join(', ');
-            const safeTitle = details.title || "appointment";
+            
+            let searchDescription = '';
+            if (hasTitle) {
+                searchDescription = `"${details.title}"`;
+            } else if (hasTime) {
+                searchDescription = `at ${details.time}`;
+            } else if (hasAttendees) {
+                const validAttendees = details.attendees.filter((attendee: any) => 
+                    attendee && typeof attendee === 'string' && attendee.trim() !== ''
+                );
+                searchDescription = `with ${validAttendees.join(', ')}`;
+            } else {
+                searchDescription = 'the specified criteria';
+            }
+            
             return {
                 success: false,
-                message: `No appointments found matching "${safeTitle}". Available appointments on ${details.date}: ${appointmentList}`,
+                message: `No appointments found matching ${searchDescription}. Available appointments on ${details.date}: ${appointmentList}`,
                 intent: 'cancel_appointment',
                 details: details
             };
