@@ -1,13 +1,13 @@
 /**
- * Voice Command Processing Functions
- * Firebase Functions v2 implementation for processing voice commands with AI
+ * Voice Command Processing Functions - Unified Firebase Auth Version
+ * Firebase Functions v2 implementation with OpenAI Assistant API and unified Google authentication
  */
 
 import { onCall } from "firebase-functions/v2/https";
-import { onRequest } from "firebase-functions/v2/https";
 import { defineSecret } from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
 import { google } from "googleapis";
+import OpenAI from "openai";
 
 // Initialize Firebase Admin SDK for server-side operations
 import { initializeApp } from "firebase-admin/app";
@@ -21,198 +21,501 @@ const customDb = getFirestore();
 
 // OpenAI API configuration
 const OPENAI_API_KEY2 = defineSecret("OPENAI_API_KEY2");
-const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 
-// Google OAuth configuration - hardcoded for testing
-const GOOGLE_CLIENT_ID = "73003602008-0jgk8u5h4s4pdu3010utqovs0kb14fgb.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET = "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";
-const REDIRECT_URI = `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
+// Initialize OpenAI client (will be initialized with API key when needed)
+let openaiClient: OpenAI | null = null;
+
+function getOpenAIClient(): OpenAI {
+    if (!openaiClient) {
+        if (!OPENAI_API_KEY2.value()) {
+            throw new Error('OpenAI API key not configured');
+        }
+        openaiClient = new OpenAI({
+            apiKey: OPENAI_API_KEY2.value()
+        });
+    }
+    return openaiClient;
+}
+
+// Google OAuth client credentials removed - iOS app now manages tokens directly
 
 // App ID for consistent document paths
 const APP_ID = "my-voice-calendly-app";
 
-// Define TypeScript interfaces for our data structures
+// Define TypeScript interfaces for our data structures  
+// @ts-ignore - Used in function signatures
 interface AppointmentData {
-    id?: string; // Document ID - will be set after creation
+    id?: string;
     title: string;
     date: string;
-    time: string;
-    duration?: number; // Optional to match iOS
-    attendees?: string[]; // Optional to match iOS
-    // Server-side only fields (not sent to client)
+    time: string | null;  // Allow null for all-day events
+    duration?: number | null;
+    attendees?: string[];
     timestamp?: Date;
     status?: string;
     createdAt?: FieldValue;
     googleCalendarEventId?: string | null;
     calendarSynced?: boolean;
     calendarSyncError?: string;
+    meetingLink?: string | null;
+    location?: string | null;
+    description?: string | null;
+    type?: string;
 }
 
-/**
- * Calculate similarity between two strings using Levenshtein distance
- * @param str1 First string
- * @param str2 Second string
- * @returns Similarity score between 0 and 1
- */
-function calculateSimilarity(str1: string, str2: string): number {
-    try {
-        // Handle null/undefined inputs
-        if (!str1 || !str2) return 0.0;
-
-        const longer = str1.length > str2.length ? str1 : str2;
-        const shorter = str1.length > str2.length ? str2 : str1;
-
-        if (longer.length === 0) return 1.0;
-
-        const distance = levenshteinDistance(longer, shorter);
-        return (longer.length - distance) / longer.length;
-    } catch (error) {
-        logger.error("Error in calculateSimilarity:", error);
-        return 0.0; // Return 0 similarity on error
-    }
-}
-
-/**
- * Calculate Levenshtein distance between two strings
- * @param str1 First string
- * @param str2 Second string
- * @returns Distance (number of edits needed)
- */
-function levenshteinDistance(str1: string, str2: string): number {
-    try {
-        const matrix = [];
-
-        for (let i = 0; i <= str2.length; i++) {
-            matrix[i] = [i];
+// OpenAI Assistant Function Tools Definitions
+const CALENDAR_FUNCTION_TOOLS = [
+    {
+        type: "function" as const,
+        function: {
+            name: "track_partial_appointment",
+            description: "Track partial appointment information while gathering missing details",
+            parameters: {
+                type: "object",
+                properties: {
+                    event_type: {
+                        type: "string",
+                        enum: ["personal", "meeting"],
+                        description: "Type of event being scheduled"
+                    },
+                    partial_data: {
+                        type: "object",
+                        description: "Partial appointment data collected so far"
+                    },
+                    missing_fields: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "List of required fields still missing"
+                    },
+                    next_question: {
+                        type: "string",
+                        description: "The question to ask the user for missing information"
+                    }
+                },
+                required: ["event_type", "partial_data", "missing_fields"]
+            }
         }
-
-        for (let j = 0; j <= str1.length; j++) {
-            matrix[0][j] = j;
+    },
+    {
+        type: "function" as const,
+        function: {
+            name: "schedule_appointment",
+            description: "Schedule a business appointment or meeting with other people",
+            parameters: {
+                type: "object",
+                properties: {
+                    title: {
+                        type: "string",
+                        description: "Meeting title (e.g., 'Project Review', 'Call with Sarah')"
+                    },
+                    date: {
+                        type: "string",
+                        description: "Date in YYYY-MM-DD format (e.g., '2025-07-25')"
+                    },
+                    time: {
+                        type: "string",
+                        description: "Time in HH:MM format (e.g., '14:30')"
+                    },
+                    duration: {
+                        type: "number",
+                        description: "Duration in minutes (e.g., 30, 60)"
+                    },
+                    attendees: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "List of attendee names or emails"
+                    },
+                    meeting_platform: {
+                        type: "string",
+                        description: "Meeting platform like 'Google Meet', 'Zoom', or 'In Person'"
+                    }
+                },
+                required: ["date", "time"] // Reduced required fields - duration will default to 30
+            }
         }
-
-        for (let i = 1; i <= str2.length; i++) {
-            for (let j = 1; j <= str1.length; j++) {
-                if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
-                    matrix[i][j] = matrix[i - 1][j - 1];
-                } else {
-                    matrix[i][j] = Math.min(
-                        matrix[i - 1][j - 1] + 1,
-                        matrix[i][j - 1] + 1,
-                        matrix[i - 1][j] + 1
-                    );
+    },
+    {
+        type: "function" as const,
+        function: {
+            name: "create_personal_event",
+            description: "Create a personal event, reminder, or activity (not involving other people)",
+            parameters: {
+                type: "object",
+                properties: {
+                    title: {
+                        type: "string",
+                        description: "Event title (e.g., 'Gym Session', 'Dentist Appointment', 'Go to Park')"
+                    },
+                    date: {
+                        type: "string",
+                        description: "Date in YYYY-MM-DD format"
+                    },
+                    time: {
+                        type: "string",
+                        description: "Time in HH:MM format (optional for all-day events)"
+                    },
+                    duration: {
+                        type: "number",
+                        description: "Duration in minutes (optional)"
+                    },
+                    location: {
+                        type: "string",
+                        description: "Location or address"
+                    },
+                    description: {
+                        type: "string",
+                        description: "Additional notes or description"
+                    },
+                    is_all_day: {
+                        type: "boolean",
+                        description: "Whether this is an all-day event/reminder"
+                    }
+                },
+                required: ["title", "date"] // Time is optional for all-day events
+            }
+        }
+    },
+    {
+        type: "function" as const,
+        function: {
+            name: "cancel_appointment",
+            description: "Cancel or delete an existing appointment or event",
+            parameters: {
+                type: "object",
+                properties: {
+                    title: {
+                        type: "string",
+                        description: "Appointment title or partial match"
+                    },
+                    date: {
+                        type: "string",
+                        description: "Date in YYYY-MM-DD format"
+                    },
+                    time: {
+                        type: "string",
+                        description: "Time in HH:MM format (optional)"
+                    },
+                    attendees: {
+                        type: "array",
+                        items: { type: "string" },
+                        description: "Attendee names to help identify the appointment"
+                    }
+                },
+                required: ["date"]
+            }
+        }
+    },
+    {
+        type: "function" as const,
+        function: {
+            name: "get_appointments",
+            description: "Retrieve appointments and events for a specific date or date range",
+            parameters: {
+                type: "object",
+                properties: {
+                    start_date: {
+                        type: "string",
+                        description: "Start date in YYYY-MM-DD format"
+                    },
+                    end_date: {
+                        type: "string",
+                        description: "End date in YYYY-MM-DD format (optional, defaults to start_date)"
+                    }
+                },
+                required: ["start_date"]
+            }
+        }
+    },
+    {
+        type: "function" as const,
+        function: {
+            name: "set_availability",
+            description: "Set user's general availability schedule for the week",
+            parameters: {
+                type: "object",
+                properties: {
+                    monday: {
+                        type: "object",
+                        properties: {
+                            start: { type: "string", description: "Start time in HH:MM format" },
+                            end: { type: "string", description: "End time in HH:MM format" }
+                        }
+                    },
+                    tuesday: {
+                        type: "object",
+                        properties: {
+                            start: { type: "string" },
+                            end: { type: "string" }
+                        }
+                    },
+                    wednesday: {
+                        type: "object",
+                        properties: {
+                            start: { type: "string" },
+                            end: { type: "string" }
+                        }
+                    },
+                    thursday: {
+                        type: "object",
+                        properties: {
+                            start: { type: "string" },
+                            end: { type: "string" }
+                        }
+                    },
+                    friday: {
+                        type: "object",
+                        properties: {
+                            start: { type: "string" },
+                            end: { type: "string" }
+                        }
+                    },
+                    saturday: {
+                        type: "object",
+                        properties: {
+                            start: { type: "string" },
+                            end: { type: "string" }
+                        }
+                    },
+                    sunday: {
+                        type: "object",
+                        properties: {
+                            start: { type: "string" },
+                            end: { type: "string" }
+                        }
+                    }
                 }
             }
         }
+    }
+];
 
-        return matrix[str2.length][str1.length];
+/**
+ * Get or create OpenAI Assistant for the voice calendar
+ */
+async function getOrCreateAssistant(): Promise<string> {
+    const openai = getOpenAIClient();
+    
+    try {
+        // Check if we have a stored assistant ID
+        const configDoc = await customDb.collection('config').doc('assistant').get();
+        
+        if (configDoc.exists) {
+            const assistantId = configDoc.data()?.assistantId;
+            
+            if (assistantId) {
+                // Verify the assistant still exists
+                try {
+                    await openai.beta.assistants.retrieve(assistantId);
+                    logger.info(`Using existing assistant: ${assistantId}`);
+                    return assistantId;
+                } catch (error) {
+                    logger.warn(`Stored assistant ${assistantId} not found, creating new one`);
+                }
+            }
+        }
+        
+        // Create new assistant if none exists or stored one is invalid
+        logger.info('Creating new OpenAI Assistant');
+        
+        const today = new Date().toISOString().slice(0, 10);
+        
+        // Assistant instructions for conversational calendar management
+        const instructions = `You are a helpful and intelligent voice calendar assistant. Your role is to help users manage their calendar through natural conversation.
+
+Today's date is ${today}. Use this as reference for relative dates like "tomorrow", "next week", etc.
+
+**Conversation Style:**
+- Be conversational, friendly, and helpful
+- Progressively gather missing information through natural questions
+- Confirm important actions before executing them
+- Remember context from previous messages in the conversation
+
+**Key Capabilities:**
+1. **Schedule Appointments:** Business meetings with other people
+2. **Create Personal Events:** Personal activities, reminders, gym sessions, appointments
+3. **Cancel Events:** Remove or delete existing calendar items  
+4. **View Calendar:** Show upcoming appointments and events
+5. **Set Availability:** Configure weekly availability schedule
+
+**Smart Context Detection:**
+- Personal events (doctor, dentist, gym, workout, personal appointment): Use create_personal_event
+- Business meetings (meeting, call, sync, review, with [person]): Use schedule_appointment
+- Recognize when participants are NOT needed (personal events)
+
+**Progressive Sync System:**
+
+TIER 1 - Save Locally (Date Required):
+- As soon as you have a date, create the appointment
+- Message: "📱 Saved locally. What time to sync with Google Calendar?"
+
+TIER 2 - Auto Sync (Date + Time):
+- Automatically sync to Google Calendar when both date and time are known
+- Message: "✅ Added to Google Calendar"
+
+**Simplified Rules:**
+1. DATE IS KING - Only date is truly required
+2. Create appointment immediately when date is known
+3. Ask maximum 2 questions then stop
+4. Accept vague inputs: "morning" = 9 AM, "afternoon" = 2 PM, "evening" = 6 PM
+5. Use the ENTIRE user input as title if unclear
+
+**Resilience:**
+- NEVER fail to create something
+- If input is unclear, use it as the title: "asdfgh" → title: "asdfgh"
+- Default missing times to null (all-day event)
+- Default duration to 30 min for meetings, 60 min for personal events
+
+**Smart Defaults and Suggestions:**
+- No time specified → Ask if all-day event or suggest common times
+- No duration → Use smart defaults based on event type
+- No title → Generate from context
+- Morning = 9:00 AM, Afternoon = 2:00 PM, Evening = 6:00 PM
+
+**Handling Incomplete Requests:**
+1. Identify event type from context
+2. Collect available information
+3. Ask ONLY for missing REQUIRED fields
+4. Suggest defaults for optional fields
+5. Summarize and confirm before creating
+
+**Example Flows:**
+User: "Visit friend Dustin tomorrow"
+You: "📱 I've saved 'Visit friend Dustin' for tomorrow. What time to add to Google Calendar?"
+User: "2 PM"
+You: "✅ Visit friend Dustin tomorrow at 2 PM added to Google Calendar"
+
+User: "Meeting with Sarah"  
+You: "📝 What day should I schedule this meeting with Sarah?"
+User: "Friday afternoon"
+You: "✅ Meeting with Sarah on Friday at 2 PM added to Google Calendar"
+
+User: "Doctor next week"
+You: "📱 Doctor appointment saved for next week. What day and time works best?"
+User: "Tuesday 10 AM"
+You: "✅ Doctor appointment Tuesday at 10 AM added to Google Calendar"
+
+**Important:** 
+- Use function tools to perform actual calendar operations
+- Be proactive in gathering missing information
+- Don't assume - ask when uncertain
+- Keep track of partial information throughout the conversation
+- Always confirm the complete details before creating the event
+
+**Context Persistence:**
+- If a conversation was interrupted, acknowledge what was already collected
+- Use the track_partial_appointment function to store collected data
+- When resuming, remind the user what information you already have
+- Example: "I see we were scheduling a doctor's appointment for tomorrow. What time works best?"`;
+
+        const assistant = await openai.beta.assistants.create({
+            name: "Voice Calendar Assistant",
+            instructions: instructions,
+            model: "gpt-4-turbo-preview",
+            tools: CALENDAR_FUNCTION_TOOLS
+        });
+
+        logger.info(`Created new OpenAI Assistant: ${assistant.id}`);
+        
+        // Store the assistant ID for future use
+        await customDb.collection('config').doc('assistant').set({
+            assistantId: assistant.id,
+            createdAt: FieldValue.serverTimestamp(),
+            model: "gpt-4-turbo-preview"
+        });
+        
+        logger.info(`Stored assistant ID in Firestore: ${assistant.id}`);
+        return assistant.id;
+        
     } catch (error) {
-        logger.error("Error in levenshteinDistance:", error);
-        return 999; // Return high distance on error
+        logger.error("Error creating or retrieving OpenAI Assistant:", error);
+        throw new Error(`Failed to get assistant: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
 }
 
 /**
- * Validate and extract user authentication
+ * Get or create conversation thread for a user
+ */
+async function getOrCreateThread(userId: string): Promise<string> {
+    const openai = getOpenAIClient();
+
+    try {
+        // Check if user has an existing active thread
+        const userDoc = await customDb.collection('users').doc(userId).get();
+        const userData = userDoc.data();
+
+        if (userData?.activeThreadId) {
+            // Try to retrieve the existing thread to ensure it's still valid
+            try {
+                await openai.beta.threads.retrieve(userData.activeThreadId);
+                logger.info(`Using existing thread for user ${userId}: ${userData.activeThreadId}`);
+                return userData.activeThreadId;
+            } catch (error) {
+                logger.warn(`Existing thread ${userData.activeThreadId} not found, creating new one`);
+            }
+        }
+
+        // Create new thread
+        const thread = await openai.beta.threads.create();
+
+        // Store thread ID in user document
+        await customDb.collection('users').doc(userId).update({
+            activeThreadId: thread.id,
+            threadCreatedAt: FieldValue.serverTimestamp()
+        });
+
+        logger.info(`Created new thread for user ${userId}: ${thread.id}`);
+        return thread.id;
+    } catch (error) {
+        logger.error(`Error getting/creating thread for user ${userId}:`, error);
+        throw new Error(`Failed to manage conversation thread: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+}
+
+/**
+ * Validate Firebase Auth user
  */
 function validateUserAuth(auth: any): string {
-    if (!auth) {
+    if (!auth || !auth.uid) {
+        logger.error('User authentication failed');
         throw new Error('User must be authenticated to use this function.');
     }
     return auth.uid;
 }
 
 /**
- * Validate voice command input
+ * Validate command text
  */
 function validateCommand(command: any): string {
-    if (!command || typeof command !== 'string' || command.trim() === '') {
+    if (!command || typeof command !== 'string' || command.trim().length === 0) {
+        logger.error('Invalid command received:', command);
         throw new Error('The command text is missing or invalid.');
     }
     return command.trim();
 }
 
 /**
- * Get an authenticated Google OAuth2 client
- * Handles token refresh and storage
+ * Get an authenticated Google OAuth2 client using provided token
  */
-async function getGoogleOAuth2Client(userId: string) {
+// @ts-ignore - Will be used by calendar functions
+async function getGoogleOAuth2Client(userId: string, accessToken: string) {
     try {
-        logger.info(`Getting Google OAuth client for user: ${userId}`);
+        logger.info(`Creating Google OAuth client for user: ${userId}`);
 
-        // Check if Google OAuth credentials are configured
-        if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET) {
-            logger.error("Google OAuth credentials not configured");
-            throw new Error('Google Calendar integration not properly configured. Missing OAuth credentials.');
+        if (!accessToken) {
+            throw new Error('Google Calendar access token is required');
         }
 
-        // Initialize OAuth2 client
-        const oAuth2Client = new google.auth.OAuth2(
-            GOOGLE_CLIENT_ID,
-            GOOGLE_CLIENT_SECRET,
-            REDIRECT_URI
-        );
+        // Initialize OAuth2 client with minimal configuration
+        const oAuth2Client = new google.auth.OAuth2();
 
-        // Fetch tokens from Firestore
-        const tokenDoc = await customDb
-            .collection('artifacts')
-            .doc(APP_ID)
-            .collection('users')
-            .doc(userId)
-            .collection('tokens')
-            .doc('googleCalendar')
-            .get();
-
-        // Check if tokens exist
-        if (!tokenDoc.exists) {
-            logger.error(`No Google Calendar tokens found for user: ${userId}`);
-            throw new Error('Google Calendar not connected. Please authorize access first.');
-        }
-
-        const tokenData = tokenDoc.data();
-
-        // Check if refresh token exists
-        if (!tokenData?.refresh_token) {
-            logger.error(`Missing refresh token for user: ${userId}`);
-            throw new Error('Google Calendar connection is incomplete. Please reauthorize access.');
-        }
-
-        // Set credentials on OAuth client
+        // Set the provided access token
         oAuth2Client.setCredentials({
-            refresh_token: tokenData.refresh_token,
-            access_token: tokenData.access_token,
-            expiry_date: tokenData.expiry_date
+            access_token: accessToken
         });
 
-        // Check if token is expired or about to expire (within 5 minutes)
-        const now = Date.now();
-        const tokenExpiryTime = tokenData.expiry_date;
-        const fiveMinutesInMs = 5 * 60 * 1000;
-
-        if (!tokenExpiryTime || now + fiveMinutesInMs >= tokenExpiryTime) {
-            logger.info(`Refreshing access token for user: ${userId}`);
-
-            // Refresh the token
-            const refreshResponse = await oAuth2Client.refreshAccessToken();
-            const tokens = refreshResponse.credentials;
-
-            // Update tokens in Firestore
-            await customDb
-                .collection('artifacts')
-                .doc(APP_ID)
-                .collection('users')
-                .doc(userId)
-                .collection('tokens')
-                .doc('googleCalendar')
-                .set({
-                    access_token: tokens.access_token,
-                    expiry_date: tokens.expiry_date,
-                    last_updated: FieldValue.serverTimestamp()
-                }, { merge: true });
-
-            logger.info(`Successfully refreshed and stored tokens for user: ${userId}`);
-        }
-
+        logger.info(`Google OAuth client configured successfully for user: ${userId}`);
         return oAuth2Client;
+
     } catch (error) {
         logger.error('Error getting Google OAuth client:', error);
         throw new Error(`Failed to initialize Google Calendar: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -220,622 +523,798 @@ async function getGoogleOAuth2Client(userId: string) {
 }
 
 /**
- * Process voice command using AI/LLM
+ * Sync appointment to Google Calendar
  */
-async function processCommandWithAI(command: string): Promise<any> {
-    const today = new Date().toISOString().slice(0, 10);
-
-    const systemPrompt = `You are a helpful and precise scheduling assistant. Your task is to analyze user commands related to scheduling appointments, setting availability, or cancelling appointments. You must extract the user's intent and all relevant details, and return them in a strict JSON format.
-
-    Today's date is ${today}. When inferring dates (e.g., "tomorrow", "next Tuesday"), use this as the reference.
-
-    --- JSON Output Structure ---
-    {
-      "intent": "string", // One of: "schedule_appointment", "set_availability", "cancel_appointment", "get_appointments", "unclear"
-      "details": { /* object with intent-specific parameters */ },
-      "llm_response_message": "string" // Optional: A natural language confirmation or clarification from you.
-    }
-
-    --- Intents and Details Schema ---
-    1. "schedule_appointment": For creating new appointments.
-       Details: {
-         "title": "string",          // e.g., "Project Review", "Call with Sarah" (can be empty if no specific title mentioned)
-         "date": "YYYY-MM-DD",       // e.g., "2025-07-25"
-         "time": "HH:MM",            // e.g., "14:30" (24-hour format)
-         "duration": "number",       // e.g., 30 (in minutes)
-         "attendees": ["string"],     // e.g., ["John", "Alice"] (can be empty array if no attendees mentioned)
-         "meeting_platform": "string" // Optional: e.g., "Google Meet", "Zoom", "In Person"
-       }
-
-    2. "set_availability": For updating user's general availability.
-       Details: {
-         "monday": { "start": "HH:MM", "end": "HH:MM" },
-         "tuesday": { "start": "HH:MM", "end": "HH:MM" },
-         "wednesday": { "start": "HH:MM", "end": "HH:MM" },
-         "thursday": { "start": "HH:MM", "end": "HH:MM" },
-         "friday": { "start": "HH:MM", "end": "HH:MM" },
-         "saturday": { "start": "HH:MM", "end": "HH:MM" }, // Use "" for start/end if unavailable
-         "sunday": { "start": "HH:MM", "end": "HH:MM" }    // Use "" for start/end if unavailable
-       }
-
-    3. "cancel_appointment": For canceling/deleting/removing an existing appointment.
-       Details: {
-         "title": "string",          // e.g., "Project Review" (can be partial match, or empty if cancelling by attendees)
-         "date": "YYYY-MM-DD",       // e.g., "2025-07-20"
-         "time": "HH:MM",            // Optional: specific time (e.g., "14:30")
-         "attendees": ["string"]     // Optional: specific people (e.g., ["John", "Sara"])
-       }
-
-    4. "get_appointments": For retrieving appointments in a specific period.
-       Details: {
-         "start_date": "YYYY-MM-DD", // e.g., "2025-07-25"
-         "end_date": "YYYY-MM-DD"    // e.g., "2025-07-31" (optional, if not specified use start_date)
-       }
-
-    5. "unclear": If the command cannot be understood or is irrelevant to scheduling.
-       Details: {} // Empty object
-    `;
-
-    if (!OPENAI_API_KEY2.value()) {
-        logger.error("OpenAI API key not configured");
-        throw new Error('OpenAI API key not configured.');
-    }
-
-    const llmRequestPayload = {
-        model: "gpt-4o-mini",
-        response_format: { "type": "json_object" },
-        messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: command }
-        ],
-        temperature: 0.7,
-        max_tokens: 500
-    };
-
+async function syncAppointmentToGoogleCalendar(userId: string, appointmentData: AppointmentData, accessToken: string): Promise<string | null> {
     try {
-        const response = await fetch(OPENAI_API_URL, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${OPENAI_API_KEY2.value()}`
-            },
-            body: JSON.stringify(llmRequestPayload)
-        });
+        logger.info(`Syncing appointment to Google Calendar for user ${userId}`);
 
-        if (!response.ok) {
-            const errorBody = await response.text();
-            logger.error(`LLM API error status: ${response.status}, body: ${errorBody}`);
-            throw new Error(`LLM API call failed: ${response.statusText}`);
-        }
+        // Get Google OAuth client with provided token
+        const oAuth2Client = await getGoogleOAuth2Client(userId, accessToken);
 
-        const llmRawResult = await response.json();
-        logger.info("Raw LLM Response:", JSON.stringify(llmRawResult));
-
-        if (llmRawResult.choices && llmRawResult.choices.length > 0 &&
-            llmRawResult.choices[0].message && llmRawResult.choices[0].message.content) {
-            const llmJsonString = llmRawResult.choices[0].message.content;
-            return JSON.parse(llmJsonString);
-        } else {
-            throw new Error("LLM response did not contain expected content structure.");
-        }
-
-    } catch (error) {
-        logger.error("Error during LLM API call or parsing:", error);
-        throw new Error('Failed to get a valid response from the AI model.');
-    }
-}
-
-/**
- * Schedule a new appointment
- */
-async function scheduleAppointment(userId: string, details: any, llmResponseMessage: string, userTimezone: string = 'America/Los_Angeles'): Promise<any> {
-    // Validate required fields
-    if (!details.date || !details.time || typeof details.duration !== 'number') {
-        throw new Error('Missing or invalid details for scheduling an appointment.');
-    }
-
-    // Generate default title if none provided - handle null/undefined/empty cases
-    let appointmentTitle = details.title;
-    if (!appointmentTitle || typeof appointmentTitle !== 'string' || appointmentTitle.trim() === '') {
-        // Create a meaningful default title based on available information
-        let defaultTitle = 'Appointment';
-        
-        if (details.attendees && Array.isArray(details.attendees) && details.attendees.length > 0) {
-            // Filter out empty/invalid attendees
-            const validAttendees = details.attendees.filter((attendee: any) => 
-                attendee && typeof attendee === 'string' && attendee.trim() !== ''
-            );
-            
-            if (validAttendees.length > 0) {
-                if (validAttendees.length === 1) {
-                    defaultTitle = `Meeting with ${validAttendees[0]}`;
-                } else if (validAttendees.length === 2) {
-                    defaultTitle = `Meeting with ${validAttendees.join(' and ')}`;
-                } else {
-                    defaultTitle = `Meeting with ${validAttendees[0]} and ${validAttendees.length - 1} others`;
-                }
-            }
-        } else {
-            // No attendees, just use time-based description
-            const timeFormatted = details.time || 'scheduled time';
-            defaultTitle = `Appointment at ${timeFormatted}`;
-        }
-        
-        appointmentTitle = defaultTitle;
-    }
-
-    // Convert date and time to Date object
-    const appointmentDateTime = new Date(`${details.date}T${details.time}:00`);
-    if (isNaN(appointmentDateTime.getTime())) {
-        throw new Error('AI provided an invalid date or time format.');
-    }
-
-    // Create appointment data - iOS-compatible format
-    const appointmentData: AppointmentData = {
-        title: appointmentTitle,
-        date: details.date,
-        time: details.time,
-        // Server-side fields
-        timestamp: appointmentDateTime,
-        status: 'confirmed',
-        createdAt: FieldValue.serverTimestamp()
-    };
-
-    // Add optional fields only if they have values
-    if (details.duration) {
-        appointmentData.duration = details.duration;
-    }
-    if (details.attendees?.length > 0) {
-        appointmentData.attendees = details.attendees;
-    }
-
-    // Google Calendar Integration
-    let calendarSyncSuccess = false;
-
-    try {
-        const oAuth2Client = await getGoogleOAuth2Client(userId);
+        // Initialize Google Calendar API
         const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
 
-        // Format attendees for Google Calendar
-        const calendarAttendees = details.attendees?.map((attendee: string) => ({
-            email: attendee.includes('@') ? attendee : `${attendee.toLowerCase().replace(/\s+/g, '.')}@example.com`,
-            displayName: attendee
-        })) || [];
+        // Parse date and time
+        const dateTimeString = `${appointmentData.date}T${appointmentData.time}:00`;
+        const startTime = new Date(dateTimeString);
 
         // Calculate end time
-        const endDateTime = new Date(appointmentDateTime);
-        endDateTime.setMinutes(endDateTime.getMinutes() + details.duration);
+        const endTime = new Date(startTime.getTime() + (appointmentData.duration || 30) * 60000);
 
-        // Create event resource
-        const eventResource: any = {
-            summary: appointmentTitle,
-            description: `Appointment created via Voice Command System`,
+        // Prepare event data
+        const eventData = {
+            summary: appointmentData.title,
+            description: appointmentData.attendees && appointmentData.attendees.length > 0
+                ? `Attendees: ${appointmentData.attendees.join(', ')}`
+                : undefined,
             start: {
-                dateTime: appointmentDateTime.toISOString(),
-                timeZone: userTimezone,
+                dateTime: startTime.toISOString(),
+                timeZone: 'UTC'
             },
             end: {
-                dateTime: endDateTime.toISOString(),
-                timeZone: userTimezone,
+                dateTime: endTime.toISOString(),
+                timeZone: 'UTC'
             },
-            attendees: calendarAttendees,
-            reminders: {
-                useDefault: true
-            }
-        };
-
-        // Add Google Meet integration if requested
-        const meetingPlatform = details.meeting_platform?.toLowerCase() || '';
-        if (meetingPlatform.includes('google meet') || meetingPlatform.includes('meet')) {
-            eventResource.conferenceData = {
+            attendees: appointmentData.attendees?.map(email => ({ email })) || [],
+            conferenceData: appointmentData.meetingLink?.includes('meet.google.com') ? {
                 createRequest: {
-                    requestId: `${userId}-${Date.now()}`,
+                    requestId: appointmentData.id,
                     conferenceSolutionKey: { type: 'hangoutsMeet' }
                 }
-            };
-        }
+            } : undefined
+        };
 
-        // Insert event to Google Calendar
-        logger.info(`Creating Google Calendar event for user ${userId}: "${appointmentTitle}"`);
-        const calendarResponse = await calendar.events.insert({
+        // Create the event
+        const response = await calendar.events.insert({
             calendarId: 'primary',
-            conferenceDataVersion: 1,
-            sendUpdates: 'all',
-            requestBody: eventResource
+            conferenceDataVersion: appointmentData.meetingLink?.includes('meet.google.com') ? 1 : 0,
+            requestBody: eventData
         });
 
-        // Extract event ID
-        appointmentData.googleCalendarEventId = calendarResponse.data.id || null;
-        calendarSyncSuccess = true;
-
-        logger.info(`Successfully created Google Calendar event: ${appointmentData.googleCalendarEventId}`);
-        appointmentData.calendarSynced = true;
+        logger.info(`Google Calendar event created: ${response.data?.id}`);
+        return response.data?.id || null;
 
     } catch (error) {
-        logger.error(`Failed to sync with Google Calendar: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        appointmentData.calendarSynced = false;
-        appointmentData.calendarSyncError = error instanceof Error ? error.message : 'Unknown error';
-    }
-
-    // Save appointment to Firestore
-    const docRef = await customDb.collection('users').doc(userId).collection('appointments').add(appointmentData);
-
-    // Update the document with its ID for iOS compatibility
-    const clientData: any = {
-        id: docRef.id,
-        title: appointmentData.title,
-        date: appointmentData.date,
-        time: appointmentData.time
-    };
-
-    // Add optional fields only if they exist
-    if (appointmentData.duration) {
-        clientData.duration = appointmentData.duration;
-    }
-    if (appointmentData.attendees) {
-        clientData.attendees = appointmentData.attendees;
-    }
-
-    // Update document with client-compatible data
-    await docRef.update(clientData);
-
-    // Return response based on calendar sync status
-    if (calendarSyncSuccess) {
-        return {
-            success: true,
-            message: llmResponseMessage || `Appointment "${appointmentTitle}" scheduled successfully and synced with Google Calendar.`,
-            intent: 'schedule_appointment',
-            details: details
-        };
-    } else {
-        return {
-            success: true,
-            message: llmResponseMessage || `Appointment "${appointmentTitle}" scheduled successfully in the app only. Failed to sync with Google Calendar.`,
-            intent: 'schedule_appointment',
-            details: details
-        };
+        logger.error(`Error syncing to Google Calendar:`, error);
+        throw error;
     }
 }
 
 /**
- * Set user availability
+ * Sync personal event to Google Calendar
  */
-async function setAvailability(userId: string, details: any, llmResponseMessage: string): Promise<any> {
-    if (Object.keys(details).length === 0) {
-        throw new Error('Missing details for setting availability.');
-    }
+async function syncPersonalEventToGoogleCalendar(userId: string, eventData: AppointmentData, accessToken: string): Promise<string | null> {
+    try {
+        logger.info(`Syncing personal event to Google Calendar for user ${userId}`);
 
-    await customDb.collection('users').doc(userId).collection('availability').doc('userAvailability').set(details, { merge: true });
+        // Get Google OAuth client with provided token
+        const oAuth2Client = await getGoogleOAuth2Client(userId, accessToken);
 
-    return {
-        success: true,
-        message: llmResponseMessage || "Your availability has been updated.",
-        intent: 'set_availability',
-        details: details
-    };
-}
+        // Initialize Google Calendar API
+        const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
 
-/**
- * Cancel appointments
- */
-async function cancelAppointments(userId: string, details: any): Promise<any> {
-    if (!details.date) {
-        throw new Error('Date is required to cancel an appointment.');
-    }
-    
-    // Allow cancellation by title, attendees, or time - at least one must be provided
-    const hasTitle = details.title && typeof details.title === 'string' && details.title.trim() !== '';
-    const hasAttendees = details.attendees && Array.isArray(details.attendees) && 
-                        details.attendees.some((attendee: any) => attendee && typeof attendee === 'string' && attendee.trim() !== '');
-    const hasTime = details.time && typeof details.time === 'string' && details.time.trim() !== '';
-    
-    if (!hasTitle && !hasAttendees && !hasTime) {
-        throw new Error('Need at least a title, attendees, or specific time to identify the appointment to cancel.');
-    }
+        // Prepare event data for Google Calendar
+        let googleEventData: any;
 
-    // Query Firestore to find appointments to cancel
-    const appointmentsToCancelQuery = await customDb.collection('users').doc(userId).collection('appointments')
-        .where('date', '==', details.date)
-        .get();
-
-    let cancelledCount = 0;
-    let availableAppointments: any[] = [];
-    let suggestedMatches: string[] = [];
-    let appointmentsToDeleteFromGCal: { id: string; googleCalendarEventId: string }[] = [];
-
-    if (!appointmentsToCancelQuery.empty) {
-        const batch = customDb.batch();
-
-        // First pass: collect all appointments and find matches
-        appointmentsToCancelQuery.docs.forEach(docSnap => {
-            try {
-                const appointmentData = docSnap.data();
-
-                if (!appointmentData) {
-                    logger.warn("Skipping appointment with no data:", docSnap.id);
-                    return;
+        // Check if this is an all-day event
+        if (!eventData.time || eventData.time === '00:00') {
+            // All-day event
+            googleEventData = {
+                summary: eventData.title,
+                description: eventData.description,
+                location: eventData.location,
+                start: {
+                    date: eventData.date,
+                    timeZone: 'UTC'
+                },
+                end: {
+                    date: eventData.date,
+                    timeZone: 'UTC'
                 }
-                
-                // Handle appointments that may not have titles
-                const appointmentTitle = appointmentData.title || `Appointment at ${appointmentData.time || 'unknown time'}`;
+            };
+        } else {
+            // Timed event
+            const dateTimeString = `${eventData.date}T${eventData.time}:00`;
+            const startTime = new Date(dateTimeString);
+            const endTime = new Date(startTime.getTime() + (eventData.duration || 60) * 60000);
 
-                availableAppointments.push({
-                    id: docSnap.id,
-                    title: appointmentTitle, // Use the fallback title
-                    originalTitle: appointmentData.title, // Keep original for matching
-                    time: appointmentData.time || '',
-                    attendees: appointmentData.attendees || [],
-                    googleCalendarEventId: appointmentData.googleCalendarEventId || null
-                });
-
-                // Smart matching logic - handle missing titles gracefully
-                let titleMatch = false;
-                if (hasTitle && appointmentData.title) {
-                    titleMatch = appointmentData.title.toLowerCase().includes(details.title.toLowerCase());
+            googleEventData = {
+                summary: eventData.title,
+                description: eventData.description,
+                location: eventData.location,
+                start: {
+                    dateTime: startTime.toISOString(),
+                    timeZone: 'UTC'
+                },
+                end: {
+                    dateTime: endTime.toISOString(),
+                    timeZone: 'UTC'
                 }
+            };
+        }
 
-                let timeMatch = false;
-                if (hasTime && appointmentData.time) {
-                    timeMatch = appointmentData.time === details.time;
-                }
-
-                let attendeeMatch = false;
-                if (hasAttendees && appointmentData.attendees && Array.isArray(appointmentData.attendees)) {
-                    attendeeMatch = appointmentData.attendees.some((attendee: string) =>
-                        attendee && details.attendees.some((searchAttendee: string) =>
-                            searchAttendee && attendee.toLowerCase().includes(searchAttendee.toLowerCase())
-                        )
-                    );
-                }
-
-                let fuzzyMatch = false;
-                try {
-                    if (hasTitle && appointmentData.title) {
-                        const searchTitle = details.title.toLowerCase();
-                        const appointmentTitleLower = appointmentData.title.toLowerCase();
-                        
-                        fuzzyMatch = appointmentTitleLower.includes(searchTitle) ||
-                            searchTitle.includes(appointmentTitleLower) ||
-                            appointmentTitleLower.split(' ').some((word: string) =>
-                                searchTitle.includes(word) && word.length > 2
-                            );
-                    }
-                } catch (error) {
-                    logger.error("Error in fuzzy matching:", error);
-                    fuzzyMatch = false;
-                }
-
-                if (titleMatch || timeMatch || attendeeMatch || fuzzyMatch) {
-                    batch.delete(docSnap.ref);
-
-                    if (appointmentData.googleCalendarEventId) {
-                        appointmentsToDeleteFromGCal.push({
-                            id: docSnap.id,
-                            googleCalendarEventId: appointmentData.googleCalendarEventId
-                        });
-                    }
-
-                    cancelledCount++;
-                }
-            } catch (error) {
-                logger.error("Error processing appointment:", docSnap.id, error);
-            }
+        // Create the event
+        const response = await calendar.events.insert({
+            calendarId: 'primary',
+            requestBody: googleEventData
         });
 
-        if (cancelledCount > 0) {
-            // Delete from Firestore
-            await batch.commit();
+        logger.info(`Google Calendar personal event created: ${response.data?.id}`);
+        return response.data?.id || null;
 
-            // Try to delete from Google Calendar if applicable
-            if (appointmentsToDeleteFromGCal.length > 0) {
-                try {
-                    const oAuth2Client = await getGoogleOAuth2Client(userId);
-                    const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
-
-                    const deletePromises = appointmentsToDeleteFromGCal.map(async (apt) => {
-                        try {
-                            await calendar.events.delete({
-                                calendarId: 'primary',
-                                eventId: apt.googleCalendarEventId,
-                                sendUpdates: 'all'
-                            });
-                            logger.info(`Successfully deleted Google Calendar event: ${apt.googleCalendarEventId}`);
-                            return { success: true, id: apt.id };
-                        } catch (error) {
-                            logger.error(`Failed to delete Google Calendar event ${apt.googleCalendarEventId}:`, error);
-                            return { success: false, id: apt.id, error };
-                        }
-                    });
-
-                    const results = await Promise.all(deletePromises);
-                    const successfulDeletes = results.filter(r => r.success).length;
-
-                    if (successfulDeletes > 0) {
-                        logger.info(`Successfully deleted ${successfulDeletes} events from Google Calendar`);
-                    }
-                } catch (error) {
-                    logger.error("Error deleting events from Google Calendar:", error);
-                }
-            }
-        } else {
-            // No exact matches found - provide smart suggestions
-            if (hasTitle) {
-                availableAppointments.forEach(apt => {
-                    try {
-                        const titleToMatch = apt.originalTitle || apt.title || '';
-                        if (titleToMatch) {
-                            const similarity = calculateSimilarity(details.title.toLowerCase(), titleToMatch.toLowerCase());
-                            if (similarity > 0.3) {
-                                const attendeeText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
-                                suggestedMatches.push(`${apt.title} at ${apt.time}${attendeeText}`);
-                            }
-                        }
-                    } catch (error) {
-                        logger.error("Error calculating similarity for appointment:", apt.title, error);
-                        const attendeeText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
-                        suggestedMatches.push(`${apt.title} at ${apt.time}${attendeeText}`);
-                    }
-                });
-            }
-        }
-    }
-
-    if (cancelledCount > 0) {
-        const countText = cancelledCount === 1 ? "appointment" : "appointments";
-        
-        // Create a meaningful description of what was cancelled
-        let cancelDescription = '';
-        if (hasTitle) {
-            cancelDescription = `"${details.title}"`;
-        } else if (hasTime) {
-            cancelDescription = `at ${details.time}`;
-        } else if (hasAttendees) {
-            const validAttendees = details.attendees.filter((attendee: any) => 
-                attendee && typeof attendee === 'string' && attendee.trim() !== ''
-            );
-            cancelDescription = `with ${validAttendees.join(', ')}`;
-        } else {
-            cancelDescription = 'the specified appointment';
-        }
-        
-        return {
-            success: true,
-            message: `Successfully cancelled ${cancelledCount} ${countText} ${cancelDescription} on ${details.date}.`,
-            intent: 'cancel_appointment',
-            details: details
-        };
-    } else {
-        if (suggestedMatches.length > 0) {
-            // Use the same description logic for failed matches
-            let searchDescription = '';
-            if (hasTitle) {
-                searchDescription = `"${details.title}"`;
-            } else if (hasTime) {
-                searchDescription = `at ${details.time}`;
-            } else if (hasAttendees) {
-                const validAttendees = details.attendees.filter((attendee: any) => 
-                    attendee && typeof attendee === 'string' && attendee.trim() !== ''
-                );
-                searchDescription = `with ${validAttendees.join(', ')}`;
-            } else {
-                searchDescription = 'the specified criteria';
-            }
-            
-            return {
-                success: false,
-                message: `No exact match found for ${searchDescription}. Did you mean one of these? ${suggestedMatches.join(', ')}`,
-                intent: 'cancel_appointment',
-                details: details
-            };
-        } else if (availableAppointments.length > 0) {
-            const appointmentList = availableAppointments.map(apt => {
-                try {
-                    const attendeeText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
-                    return `${apt.title || 'Untitled appointment'} at ${apt.time || 'unknown time'}${attendeeText}`;
-                } catch (error) {
-                    logger.error("Error formatting appointment:", apt, error);
-                    return `${apt.title || 'Unknown appointment'} at ${apt.time || 'unknown time'}`;
-                }
-            }).join(', ');
-            
-            let searchDescription = '';
-            if (hasTitle) {
-                searchDescription = `"${details.title}"`;
-            } else if (hasTime) {
-                searchDescription = `at ${details.time}`;
-            } else if (hasAttendees) {
-                const validAttendees = details.attendees.filter((attendee: any) => 
-                    attendee && typeof attendee === 'string' && attendee.trim() !== ''
-                );
-                searchDescription = `with ${validAttendees.join(', ')}`;
-            } else {
-                searchDescription = 'the specified criteria';
-            }
-            
-            return {
-                success: false,
-                message: `No appointments found matching ${searchDescription}. Available appointments on ${details.date}: ${appointmentList}`,
-                intent: 'cancel_appointment',
-                details: details
-            };
-        } else {
-            return {
-                success: false,
-                message: `No appointments found on ${details.date}.`,
-                intent: 'cancel_appointment',
-                details: details
-            };
-        }
+    } catch (error) {
+        logger.error(`Error syncing personal event to Google Calendar:`, error);
+        throw error;
     }
 }
 
 /**
- * Get appointments for a date range
+ * Cancel event in Google Calendar
  */
-async function getAppointments(userId: string, details: any, llmResponseMessage: string): Promise<any> {
-    if (!details.start_date) {
-        throw new Error('Missing start date for getting appointments.');
+async function cancelGoogleCalendarEvent(userId: string, googleEventId: string, accessToken: string): Promise<void> {
+    try {
+        logger.info(`Cancelling Google Calendar event ${googleEventId} for user ${userId}`);
+
+        // Get Google OAuth client with provided token
+        const oAuth2Client = await getGoogleOAuth2Client(userId, accessToken);
+
+        // Initialize Google Calendar API
+        const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
+
+        // Delete the event
+        await calendar.events.delete({
+            calendarId: 'primary',
+            eventId: googleEventId
+        });
+
+        logger.info(`Google Calendar event ${googleEventId} cancelled successfully`);
+
+    } catch (error) {
+        logger.error(`Error cancelling Google Calendar event ${googleEventId}:`, error);
+        throw error;
     }
+}
 
-    const startDate = details.start_date;
-    const endDate = details.end_date || details.start_date;
-
-    const appointmentsQuery = await customDb.collection('users').doc(userId).collection('appointments')
-        .where('date', '>=', startDate)
-        .where('date', '<=', endDate)
-        .orderBy('date')
-        .orderBy('time')
-        .get();
-
-    const appointments: any[] = [];
-    appointmentsQuery.forEach(doc => {
-        const appointmentData = doc.data();
-        // Return only basic fields
-        const appointment: any = {
-            id: appointmentData.id || doc.id, // Use stored id or fallback to document id
-            title: appointmentData.title,
-            date: appointmentData.date,
-            time: appointmentData.time
-        };
-
-        // Add optional fields only if they exist
-        if (appointmentData.duration) {
-            appointment.duration = appointmentData.duration;
+// Helper function to get partial appointment context
+async function getPartialAppointmentContext(userId: string): Promise<any> {
+    try {
+        const partialDoc = await customDb
+            .collection('users')
+            .doc(userId)
+            .collection('partialAppointments')
+            .doc('current')
+            .get();
+        
+        if (partialDoc.exists) {
+            const data = partialDoc.data();
+            logger.info(`Found partial appointment context for user ${userId}:`, data);
+            return data;
         }
-        if (appointmentData.attendees) {
-            appointment.attendees = appointmentData.attendees;
-        }
+        
+        return null;
+    } catch (error) {
+        logger.error(`Error retrieving partial appointment context for user ${userId}:`, error);
+        return null;
+    }
+}
 
-        appointments.push(appointment);
-    });
+// Helper function to clear partial appointment data after successful creation
+async function clearPartialAppointmentContext(userId: string): Promise<void> {
+    try {
+        await customDb
+            .collection('users')
+            .doc(userId)
+            .collection('partialAppointments')
+            .doc('current')
+            .delete();
+        
+        logger.info(`Cleared partial appointment context for user ${userId}`);
+    } catch (error) {
+        logger.error(`Error clearing partial appointment context for user ${userId}:`, error);
+    }
+}
 
-    if (appointments.length > 0) {
-        const appointmentsSummary = appointments.map(apt => {
-            const attendeesText = apt.attendees && apt.attendees.length > 0 ? ` with ${apt.attendees.join(', ')}` : '';
-            const durationText = apt.duration ? ` (${apt.duration} minutes)` : '';
-            return `${apt.title} on ${apt.date} at ${apt.time}${durationText}${attendeesText}`;
-        }).join('; ');
+// Helper function to determine if event should be all-day
+function isAllDayEvent(title: string): boolean {
+    if (!title) return false;
+    const allDayKeywords = ['birthday', 'holiday', 'anniversary', 'vacation', 'day off'];
+    return allDayKeywords.some(keyword => 
+        title.toLowerCase().includes(keyword)
+    );
+}
 
-        return {
-            success: true,
-            message: llmResponseMessage || `You have ${appointments.length} appointment(s): ${appointmentsSummary}`,
-            intent: 'get_appointments',
-            details: details,
-            appointments: appointments // Already contains only iOS-compatible fields
-        };
+// Helper function to check if ready for Google Calendar sync
+function isReadyForGoogleCalendar(appointment: any): boolean {
+    // All-day events only need date
+    if (isAllDayEvent(appointment.title)) {
+        return !!appointment.date;
+    }
+    
+    // Everything else needs both date and time
+    return !!(appointment.date && appointment.time);
+}
+
+// Helper function to get status message
+function getStatusMessage(appointment: any): string {
+    if (!appointment.date) {
+        return "📝 What day should I schedule this?";
+    } else if (!appointment.time && !isAllDayEvent(appointment.title)) {
+        return "📱 Saved locally. What time to sync with Google Calendar?";
+    } else if (appointment.googleCalendarEventId) {
+        return "✅ In Google Calendar";
+    } else if (isReadyForGoogleCalendar(appointment)) {
+        return "⏳ Syncing to Google Calendar...";
     } else {
+        return "📱 Saved locally";
+    }
+}
+
+// Implementation for tracking partial appointment data
+async function trackPartialAppointment(userId: string, details: any): Promise<any> {
+    try {
+        logger.info(`Tracking partial appointment for user ${userId}:`, details);
+        
+        const { event_type, partial_data, missing_fields, next_question } = details;
+        
+        // Store partial data in Firestore for persistence
+        await customDb
+            .collection('users')
+            .doc(userId)
+            .collection('partialAppointments')
+            .doc('current')
+            .set({
+                eventType: event_type,
+                collectedData: partial_data,
+                missingFields: missing_fields,
+                lastUpdated: FieldValue.serverTimestamp()
+            }, { merge: true });
+        
+        logger.info(`Stored partial appointment data for user ${userId}`);
+        
+        const response: any = {
+            success: true,
+            tracking: true,
+            event_type,
+            collected_data: partial_data,
+            missing_fields,
+            message: next_question || `I need a few more details to create your ${event_type === 'personal' ? 'personal event' : 'meeting'}.`,
+            suggestions: [] as string[]
+        };
+        
+        // Add smart suggestions based on missing fields
+        if (missing_fields.includes('time')) {
+            response.suggestions = ['9:00 AM', '2:00 PM', '3:00 PM', 'All-day event'];
+        } else if (missing_fields.includes('date')) {
+            response.suggestions = ['Today', 'Tomorrow', 'Next Monday', 'Next Friday'];
+        } else if (missing_fields.includes('duration')) {
+            response.suggestions = ['30 minutes', '1 hour', '2 hours'];
+        }
+        
+        logger.info(`Partial appointment tracked, missing fields: ${missing_fields.join(', ')}`);
+        return response;
+        
+    } catch (error) {
+        logger.error(`Error tracking partial appointment for user ${userId}:`, error);
+        return {
+            success: false,
+            message: `Failed to track appointment details: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
+    }
+}
+
+// Helper function to handle function calls from OpenAI Assistant
+async function handleFunctionCall(functionName: string, functionArgs: any, userId: string, userTimezone: string = 'America/Los_Angeles', accessToken?: string): Promise<any> {
+    logger.info(`Executing function: ${functionName} with args:`, JSON.stringify(functionArgs));
+
+    try {
+        switch (functionName) {
+            case 'track_partial_appointment':
+                return await trackPartialAppointment(userId, functionArgs);
+
+            case 'schedule_appointment':
+                return await scheduleAppointment(userId, functionArgs, "Appointment scheduled successfully.", userTimezone, accessToken);
+
+            case 'create_personal_event':
+                return await createPersonalEvent(userId, functionArgs, "Personal event created successfully.", userTimezone, accessToken);
+
+            case 'cancel_appointment':
+                return await cancelAppointments(userId, functionArgs, accessToken);
+
+            case 'get_appointments':
+                return await getAppointments(userId, functionArgs, "Here are your appointments:");
+
+            case 'set_availability':
+                return await setAvailability(userId, functionArgs, "Your availability has been updated.");
+
+            default:
+                throw new Error(`Unknown function: ${functionName}`);
+        }
+    } catch (error) {
+        logger.error(`Error executing function ${functionName}:`, error);
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error occurred',
+            message: `Failed to execute ${functionName}: ${error instanceof Error ? error.message : 'Unknown error'}`
+        };
+    }
+}
+
+// Implementation for scheduling appointments
+async function scheduleAppointment(userId: string, details: any, message: string, timezone: string, accessToken?: string): Promise<any> {
+    try {
+        logger.info(`Scheduling appointment for user ${userId}:`, details);
+
+        // Only date is truly required - we can work with that
+        if (!details.date) {
+            return {
+                success: false,
+                message: '📝 What day should I schedule this meeting?',
+                missing_fields: ['date'],
+                partial_data: details
+            };
+        }
+
+        // Generate appointment ID
+        const appointmentId = customDb.collection('users').doc().id;
+
+        // Prepare appointment data - handle all undefined fields
+        const appointmentData: AppointmentData = {
+            id: appointmentId,
+            title: details.title || details.originalInput || 'Meeting',
+            date: details.date,
+            time: details.time || null,  // null for all-day or TBD
+            duration: details.time ? (details.duration || 30) : null,  // Only set if has time
+            attendees: details.attendees || [],
+            timestamp: new Date(),
+            status: 'scheduled',
+            createdAt: FieldValue.serverTimestamp(),
+            googleCalendarEventId: null,
+            calendarSynced: false,
+            meetingLink: null,  // Initialize as null
+            location: null,      // Initialize as null
+            description: null    // Initialize as null
+        };
+
+        // Add meeting link if meeting platform is specified
+        if (details.meeting_platform) {
+            if (details.meeting_platform.toLowerCase().includes('google meet')) {
+                appointmentData.meetingLink = 'https://meet.google.com/new';
+            } else if (details.meeting_platform.toLowerCase().includes('zoom')) {
+                appointmentData.meetingLink = 'https://zoom.us/j/placeholder';
+            }
+        }
+
+        // Save to Firestore
+        await customDb
+            .collection('users')
+            .doc(userId)
+            .collection('appointments')
+            .doc(appointmentId)
+            .set(appointmentData);
+
+        logger.info(`Appointment saved to Firestore for user ${userId}: ${appointmentId}`);
+        
+        // Clear any partial appointment context after successful creation
+        await clearPartialAppointmentContext(userId);
+
+        // Only sync to Google Calendar if ready
+        let statusMessage = getStatusMessage(appointmentData);
+        
+        if (isReadyForGoogleCalendar(appointmentData) && accessToken) {
+            try {
+                const googleEventId = await syncAppointmentToGoogleCalendar(userId, appointmentData, accessToken);
+                if (googleEventId) {
+                    // Update the appointment with Google Calendar event ID
+                    await customDb
+                        .collection('users')
+                        .doc(userId)
+                        .collection('appointments')
+                        .doc(appointmentId)
+                        .update({
+                            googleCalendarEventId: googleEventId,
+                            calendarSynced: true
+                        });
+                    appointmentData.googleCalendarEventId = googleEventId;
+                    appointmentData.calendarSynced = true;
+                    statusMessage = "✅ Added to Google Calendar";
+                    logger.info(`Appointment synced to Google Calendar: ${googleEventId}`);
+                }
+            } catch (calendarError) {
+                logger.warn(`Failed to sync appointment to Google Calendar:`, calendarError);
+                await customDb
+                    .collection('users')
+                    .doc(userId)
+                    .collection('appointments')
+                    .doc(appointmentId)
+                    .update({
+                        calendarSyncError: calendarError instanceof Error ? calendarError.message : 'Unknown error'
+                    });
+                statusMessage = "📱 Saved locally (Google sync failed)";
+            }
+        }
+
         return {
             success: true,
-            message: llmResponseMessage || `No appointments found from ${startDate}${endDate !== startDate ? ` to ${endDate}` : ''}.`,
-            intent: 'get_appointments',
-            details: details,
+            message: statusMessage,
+            appointment: appointmentData
+        };
+
+    } catch (error) {
+        logger.error(`Error scheduling appointment for user ${userId}:`, error);
+        return {
+            success: false,
+            message: `Failed to schedule appointment: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
+    }
+}
+
+async function createPersonalEvent(userId: string, details: any, message: string, timezone: string, accessToken?: string): Promise<any> {
+    try {
+        logger.info(`Creating personal event for user ${userId}:`, details);
+
+        // Validate required fields - only date is truly required
+        if (!details.date) {
+            return {
+                success: false,
+                message: `📝 What day should I schedule this?`,
+                missing_fields: ['date'],
+                partial_data: details
+            };
+        }
+
+        // Generate event ID
+        const eventId = customDb.collection('users').doc().id;
+
+        // Prepare event data - handle undefined fields properly
+        const eventData: AppointmentData = {
+            id: eventId,
+            title: details.title || details.originalInput || "Personal Event",
+            date: details.date,
+            time: details.time || null, // Use null instead of '00:00' for all-day
+            duration: details.time ? (details.duration || 60) : null, // Only set duration if has time
+            location: details.location || null,  // Use null, not undefined
+            description: details.description || null,  // Use null, not undefined
+            type: 'personal_event',
+            timestamp: new Date(),
+            status: 'scheduled',
+            createdAt: FieldValue.serverTimestamp(),
+            googleCalendarEventId: null,
+            calendarSynced: false
+        };
+
+        // Save to Firestore
+        await customDb
+            .collection('users')
+            .doc(userId)
+            .collection('appointments')
+            .doc(eventId)
+            .set(eventData);
+
+        logger.info(`Personal event saved to Firestore for user ${userId}: ${eventId}`);
+        
+        // Clear any partial appointment context after successful creation
+        await clearPartialAppointmentContext(userId);
+
+        // Only sync to Google Calendar if ready
+        let statusMessage = getStatusMessage(eventData);
+        
+        if (isReadyForGoogleCalendar(eventData) && accessToken) {
+            try {
+                const googleEventId = await syncPersonalEventToGoogleCalendar(userId, eventData, accessToken);
+                if (googleEventId) {
+                    // Update the event with Google Calendar event ID
+                    await customDb
+                        .collection('users')
+                        .doc(userId)
+                        .collection('appointments')
+                        .doc(eventId)
+                        .update({
+                            googleCalendarEventId: googleEventId,
+                            calendarSynced: true
+                        });
+                    eventData.googleCalendarEventId = googleEventId;
+                    eventData.calendarSynced = true;
+                    statusMessage = "✅ Added to Google Calendar";
+                    logger.info(`Personal event synced to Google Calendar: ${googleEventId}`);
+                }
+            } catch (calendarError) {
+                logger.warn(`Failed to sync personal event to Google Calendar:`, calendarError);
+                await customDb
+                    .collection('users')
+                    .doc(userId)
+                    .collection('appointments')
+                    .doc(eventId)
+                    .update({
+                        calendarSyncError: calendarError instanceof Error ? calendarError.message : 'Unknown error'
+                    });
+                statusMessage = "📱 Saved locally (Google sync failed)";
+            }
+        }
+
+        return {
+            success: true,
+            message: statusMessage,
+            appointment: eventData
+        };
+
+    } catch (error) {
+        logger.error(`Error creating personal event for user ${userId}:`, error);
+        return {
+            success: false,
+            message: `Failed to create personal event: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
+    }
+}
+
+async function cancelAppointments(userId: string, details: any, accessToken?: string): Promise<any> {
+    try {
+        logger.info(`Cancelling appointments for user ${userId}:`, details);
+
+        // Validate required fields
+        if (!details.date) {
+            throw new Error('Date is required for cancelling appointments');
+        }
+
+        // Build query to find matching appointments
+        let query = customDb
+            .collection('users')
+            .doc(userId)
+            .collection('appointments')
+            .where('date', '==', details.date)
+            .where('status', '!=', 'cancelled');
+
+        // Add additional filters if provided
+        const querySnapshot = await query.get();
+
+        if (querySnapshot.empty) {
+            return {
+                success: false,
+                message: `No appointments found for ${details.date}`,
+                error: 'No matching appointments found'
+            };
+        }
+
+        let cancelledCount = 0;
+        let calendarErrorCount = 0;
+        const cancelledAppointments = [];
+
+        // Filter appointments based on additional criteria
+        for (const doc of querySnapshot.docs) {
+            const appointment = doc.data() as AppointmentData;
+            let shouldCancel = true;
+
+            // Check title match if provided
+            if (details.title) {
+                const titleMatch = appointment.title.toLowerCase().includes(details.title.toLowerCase());
+                if (!titleMatch) shouldCancel = false;
+            }
+
+            // Check time match if provided
+            if (details.time && shouldCancel) {
+                const timeMatch = appointment.time === details.time;
+                if (!timeMatch) shouldCancel = false;
+            }
+
+            // Check attendees match if provided
+            if (details.attendees && details.attendees.length > 0 && shouldCancel) {
+                const attendeesMatch = details.attendees.some((attendee: string) =>
+                    appointment.attendees?.some(a => a.toLowerCase().includes(attendee.toLowerCase()))
+                );
+                if (!attendeesMatch) shouldCancel = false;
+            }
+
+            if (shouldCancel) {
+                // Update appointment status to cancelled
+                await doc.ref.update({
+                    status: 'cancelled',
+                    cancelledAt: FieldValue.serverTimestamp()
+                });
+
+                // Try to cancel in Google Calendar
+                try {
+                    if (appointment.googleCalendarEventId && accessToken) {
+                        await cancelGoogleCalendarEvent(userId, appointment.googleCalendarEventId, accessToken);
+                        logger.info(`Cancelled Google Calendar event: ${appointment.googleCalendarEventId}`);
+                    }
+                } catch (calendarError) {
+                    logger.warn(`Failed to cancel Google Calendar event:`, calendarError);
+                    calendarErrorCount++;
+                    // Update with calendar sync error but don't fail the entire operation
+                    await doc.ref.update({
+                        calendarSyncError: calendarError instanceof Error ? calendarError.message : 'Unknown error'
+                    });
+                }
+
+                cancelledCount++;
+                cancelledAppointments.push({
+                    id: appointment.id,
+                    title: appointment.title,
+                    date: appointment.date,
+                    time: appointment.time
+                });
+            }
+        }
+
+        if (cancelledCount === 0) {
+            return {
+                success: false,
+                message: 'No matching appointments found to cancel',
+                error: 'No appointments matched the cancellation criteria'
+            };
+        }
+
+        const message = `Cancelled ${cancelledCount} appointment${cancelledCount > 1 ? 's' : ''}${calendarErrorCount > 0 ? ` (${calendarErrorCount} calendar sync errors)` : ''}`;
+
+        return {
+            success: true,
+            message,
+            cancelledCount,
+            appointments: cancelledAppointments
+        };
+
+    } catch (error) {
+        logger.error(`Error cancelling appointments for user ${userId}:`, error);
+        return {
+            success: false,
+            message: `Failed to cancel appointments: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
+    }
+}
+
+async function getAppointments(userId: string, details: any, message: string): Promise<any> {
+    try {
+        logger.info(`Getting appointments for user ${userId}:`, details);
+
+        // Validate required fields
+        if (!details.start_date) {
+            throw new Error('Start date is required for retrieving appointments');
+        }
+
+        const startDate = details.start_date;
+        const endDate = details.end_date || details.start_date;
+
+        logger.info(`Fetching appointments from ${startDate} to ${endDate}`);
+
+        // Build query to find appointments in date range
+        let query = customDb
+            .collection('users')
+            .doc(userId)
+            .collection('appointments')
+            .where('date', '>=', startDate)
+            .where('date', '<=', endDate)
+            .where('status', '!=', 'cancelled')
+            .orderBy('date', 'asc')
+            .orderBy('time', 'asc');
+
+        const querySnapshot = await query.get();
+
+        if (querySnapshot.empty) {
+            return {
+                success: true,
+                message: `No appointments found between ${startDate} and ${endDate}`,
+                appointments: []
+            };
+        }
+
+        const appointments = [];
+        for (const doc of querySnapshot.docs) {
+            const appointmentData = doc.data() as AppointmentData;
+            appointments.push({
+                id: appointmentData.id,
+                title: appointmentData.title,
+                date: appointmentData.date,
+                time: appointmentData.time,
+                duration: appointmentData.duration,
+                attendees: appointmentData.attendees,
+                location: appointmentData.location,
+                description: appointmentData.description,
+                type: appointmentData.type,
+                meetingLink: appointmentData.meetingLink,
+                calendarSynced: appointmentData.calendarSynced
+            });
+        }
+
+        logger.info(`Found ${appointments.length} appointments for user ${userId}`);
+
+        // Format the response message based on the date range
+        let responseMessage = message;
+        if (startDate === endDate) {
+            responseMessage = `You have ${appointments.length} appointment${appointments.length !== 1 ? 's' : ''} on ${startDate}`;
+        } else {
+            responseMessage = `You have ${appointments.length} appointment${appointments.length !== 1 ? 's' : ''} from ${startDate} to ${endDate}`;
+        }
+
+        // Add summary of appointments
+        if (appointments.length > 0) {
+            const appointmentSummary = appointments.map(apt => {
+                const timeStr = apt.time !== '00:00' ? ` at ${apt.time}` : '';
+                const typeStr = apt.type === 'personal_event' ? ' (personal)' : '';
+                return `- ${apt.title}${timeStr}${typeStr}`;
+            }).join('\n');
+
+            responseMessage += ':\n' + appointmentSummary;
+        }
+
+        return {
+            success: true,
+            message: responseMessage,
+            appointments,
+            count: appointments.length,
+            dateRange: { startDate, endDate }
+        };
+
+    } catch (error) {
+        logger.error(`Error getting appointments for user ${userId}:`, error);
+        return {
+            success: false,
+            message: `Failed to retrieve appointments: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            error: error instanceof Error ? error.message : 'Unknown error',
             appointments: []
         };
     }
 }
 
+async function setAvailability(userId: string, details: any, message: string): Promise<any> {
+    try {
+        logger.info(`Setting availability for user ${userId}:`, details);
+
+        // Prepare availability data
+        const availabilityData = {
+            monday: details.monday || null,
+            tuesday: details.tuesday || null,
+            wednesday: details.wednesday || null,
+            thursday: details.thursday || null,
+            friday: details.friday || null,
+            saturday: details.saturday || null,
+            sunday: details.sunday || null,
+            lastUpdated: FieldValue.serverTimestamp()
+        };
+
+        // Save to Firestore
+        await customDb
+            .collection('users')
+            .doc(userId)
+            .collection('settings')
+            .doc('availability')
+            .set(availabilityData, { merge: true });
+
+        logger.info(`Availability saved for user ${userId}`);
+
+        // Create a summary of the availability
+        const availableDays = [];
+        for (const [day, schedule] of Object.entries(availabilityData)) {
+            if (schedule && typeof schedule === 'object' && 'start' in schedule && 'end' in schedule) {
+                availableDays.push(`${day}: ${schedule.start} - ${schedule.end}`);
+            }
+        }
+
+        const summaryMessage = availableDays.length > 0
+            ? `${message}\nYour availability:\n${availableDays.join('\n')}`
+            : message;
+
+        return {
+            success: true,
+            message: summaryMessage,
+            availability: availabilityData
+        };
+
+    } catch (error) {
+        logger.error(`Error setting availability for user ${userId}:`, error);
+        return {
+            success: false,
+            message: `Failed to set availability: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
+    }
+}
+
 /**
- * Process voice command using AI and perform scheduling operations
+ * Process conversational voice command using OpenAI Assistant API
  * This is a Callable function that can be called directly from client apps
  */
 export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async (request) => {
@@ -847,245 +1326,233 @@ export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async 
 
     const userCommandText = validateCommand(data.command);
     const userTimezone = data.timezone || 'America/Los_Angeles'; // Default fallback
-    logger.info(`Processing command for user ${userId}: "${userCommandText}" in timezone: ${userTimezone}`);
+    logger.info(`Processing conversational command for user ${userId}: "${userCommandText}" in timezone: ${userTimezone}`);
+
+    const openai = getOpenAIClient();
 
     try {
-        // --- AI PROCESSING ---
-        const llmResponse = await processCommandWithAI(userCommandText);
-        logger.info("Parsed LLM Response:", JSON.stringify(llmResponse));
+        // --- ASSISTANT & THREAD MANAGEMENT ---
+        const assistantId = await getOrCreateAssistant();
+        const threadId = await getOrCreateThread(userId);
 
-        const { intent, details, llm_response_message } = llmResponse;
+        logger.info(`Using Assistant ${assistantId} and Thread ${threadId} for user ${userId}`);
 
-        // --- INTENT-BASED DISPATCH ---
-        switch (intent) {
-            case "schedule_appointment":
-                return await scheduleAppointment(userId, details, llm_response_message, userTimezone);
-
-            case "set_availability":
-                return await setAvailability(userId, details, llm_response_message);
-
-            case "cancel_appointment":
-                return await cancelAppointments(userId, details);
-
-            case "get_appointments":
-                return await getAppointments(userId, details, llm_response_message);
-
-            case "unclear":
-                return {
-                    success: false,
-                    message: llm_response_message || "I didn't understand that command. Please try again with a clear instruction to schedule, set availability, cancel, or get appointments.",
-                    intent: intent,
-                    details: details
-                };
-
-            default:
-                return {
-                    success: false,
-                    message: "Unknown intent detected by the system. Please try again.",
-                    intent: intent,
-                    details: details
-                };
+        // --- CHECK FOR PARTIAL CONTEXT ---
+        const partialContext = await getPartialAppointmentContext(userId);
+        let contextualizedCommand = userCommandText;
+        
+        if (partialContext?.collectedData) {
+            const contextInfo = `[Previous context: Event type: ${partialContext.eventType}, Collected data: ${JSON.stringify(partialContext.collectedData)}, Missing: ${partialContext.missingFields?.join(', ')}]\n\n`;
+            contextualizedCommand = contextInfo + userCommandText;
+            logger.info(`Adding partial context to message for user ${userId}`);
+        }
+        
+        // --- ADD USER MESSAGE TO THREAD ---
+        // Check for active runs and handle thread concurrency issues
+        let finalThreadId = threadId;
+        try {
+            await openai.beta.threads.messages.create(threadId, {
+                role: "user",
+                content: contextualizedCommand
+            });
+        } catch (error) {
+            if (error instanceof Error && error.message.includes('while a run') && error.message.includes('is active')) {
+                logger.warn(`Thread ${threadId} has active run, attempting to resolve...`);
+                
+                // Try to find and cancel the active run
+                try {
+                    const runs = await openai.beta.threads.runs.list(threadId);
+                    const activeRun = runs.data.find(run => 
+                        run.status === 'queued' || 
+                        run.status === 'in_progress' || 
+                        run.status === 'requires_action'
+                    );
+                    
+                    if (activeRun) {
+                        logger.info(`Cancelling active run: ${activeRun.id}`);
+                        await openai.beta.threads.runs.cancel(threadId, activeRun.id);
+                        
+                        // Wait for cancellation to complete
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                        
+                        // Retry adding message to the same thread
+                        await openai.beta.threads.messages.create(threadId, {
+                            role: "user",
+                            content: contextualizedCommand
+                        });
+                        logger.info(`Successfully added message to thread after cancelling active run`);
+                    }
+                } catch (cancelError) {
+                    logger.warn(`Failed to cancel active run, creating new thread:`, cancelError);
+                    
+                    // Create a new thread as fallback
+                    const newThread = await openai.beta.threads.create();
+                    finalThreadId = newThread.id;
+                    
+                    // Update user's thread ID in database
+                    await customDb.collection('users').doc(userId).update({
+                        activeThreadId: finalThreadId,
+                        threadCreatedAt: FieldValue.serverTimestamp(),
+                        previousThreadId: threadId // Keep reference to old thread
+                    });
+                    
+                    // Add message to new thread
+                    await openai.beta.threads.messages.create(finalThreadId, {
+                        role: "user",
+                        content: contextualizedCommand
+                    });
+                    
+                    logger.info(`Created new thread ${finalThreadId} and added message`);
+                }
+            } else {
+                // Re-throw other errors
+                throw error;
+            }
         }
 
-    } catch (error) {
-        logger.error("Error during voice command processing:", error);
-        throw new Error(error instanceof Error ? error.message : 'An unexpected server error occurred during action processing.');
-    }
-});
-
-/**
- * Google OAuth 2.0 Callback Handler
- * Handles the OAuth callback from Google after user grants consent
- * 
- * @param req - HTTP request containing authorization code and state
- * @param res - HTTP response to send back to user
- */
-export const googleOAuthCallback = onRequest(async (req, res) => {
-    try {
-        // 1. Extract code and state from query parameters
-        const { code, state } = req.query;
-
-        if (!code || !state) {
-            logger.error("Missing required parameters in OAuth callback", { code: !!code, state: !!state });
-            res.status(400).send(`
-                <html>
-                    <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-                        <h1 style="color: #d32f2f;">Authorization Failed</h1>
-                        <p>Missing required parameters. Please try the authorization process again.</p>
-                        <button onclick="window.close()">Close Window</button>
-                    </body>
-                </html>
-            `);
-            return;
-        }
-
-        // 2. Extract User ID from state (Firebase Auth UID)
-        const userId = state as string;
-
-        // Validate that the userId is a valid Firebase Auth UID format
-        if (!userId || userId.length < 10) {
-            logger.error("Invalid user ID in OAuth callback state:", userId);
-            res.status(400).send(`
-                <html>
-                    <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-                        <h1 style="color: #d32f2f;">Authorization Failed</h1>
-                        <p>Invalid user session. Please try the authorization process again.</p>
-                        <button onclick="window.close()">Close Window</button>
-                    </body>
-                </html>
-            `);
-            return;
-        }
-
-        logger.info(`Processing OAuth callback for authenticated user: ${userId}`);
-
-        // Create user document if it doesn't exist
-        await createUserIfNotExists(userId);
-
-        // 3. Retrieve Google OAuth credentials - hardcoded for testing
-        const clientId = "73003602008-0jgk8u5h4s4pdu3010utqovs0kb14fgb.apps.googleusercontent.com";
-        const clientSecret = "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";
-
-        // Debug logging - hardcoded credentials test
-        logger.info("Debug - hardcoded clientId:", clientId);
-        logger.info("Debug - hardcoded clientSecret:", clientSecret ? "***SET***" : "***NOT SET***");
-
-        if (!clientId || !clientSecret) {
-            logger.error("Google OAuth credentials not configured");
-            res.status(500).send(`
-                <html>
-                    <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
-                        <h1 style="color: #d32f2f;">Configuration Error</h1>
-                        <p>OAuth credentials not properly configured. Please contact support.</p>
-                        <button onclick="window.close()">Close Window</button>
-                    </body>
-                </html>
-            `);
-            return;
-        }
-
-        // 4. Initialize Google OAuth2 client
-        const redirectUri = `https://us-central1-${process.env.GCLOUD_PROJECT}.cloudfunctions.net/googleOAuthCallback`;
-        const oAuth2Client = new google.auth.OAuth2(clientId, clientSecret, redirectUri);
-
-        logger.info(`OAuth redirect URI: ${redirectUri}`);
-
-        // 5. Exchange authorization code for tokens
-        const { tokens } = await oAuth2Client.getToken(code as string);
-        logger.info("Successfully exchanged authorization code for tokens", {
-            hasAccessToken: !!tokens.access_token,
-            hasRefreshToken: !!tokens.refresh_token,
-            expiryDate: tokens.expiry_date
+        // --- RUN ASSISTANT ---
+        const run = await openai.beta.threads.runs.create(finalThreadId, {
+            assistant_id: assistantId
         });
 
-        // 6. Store tokens in Firestore
-        const appId = "my-voice-calendly-app";
-        const db = getFirestore();
+        logger.info(`Started Assistant run: ${run.id}`);
 
-        const tokenData = {
-            access_token: tokens.access_token || null,
-            refresh_token: tokens.refresh_token || null, // Can be null if not first-time auth
-            expiry_date: tokens.expiry_date || null,
-            scopes: [
-                'https://www.googleapis.com/auth/calendar.events',
-                'https://www.googleapis.com/auth/userinfo.profile',
-                'https://www.googleapis.com/auth/userinfo.email'
-            ],
-            last_updated: FieldValue.serverTimestamp()
-        };
+        // --- POLL FOR COMPLETION ---
+        let runStatus = run;
+        const maxPollingTime = 30000; // 30 seconds
+        const pollingInterval = 1000; // 1 second
+        const startTime = Date.now();
 
-        const tokenDocRef = db
-            .collection('artifacts')
-            .doc(appId)
-            .collection('users')
-            .doc(userId)
-            .collection('tokens')
-            .doc('googleCalendar');
+        while (runStatus.status === 'queued' || runStatus.status === 'in_progress') {
+            if (Date.now() - startTime > maxPollingTime) {
+                throw new Error('Assistant run timed out');
+            }
 
-        logger.info(`Attempting to store tokens at path: ${tokenDocRef.path}`);
-
-        await tokenDocRef.set(tokenData, { merge: true });
-
-        // Verify the document was created
-        const verifyDoc = await tokenDocRef.get();
-        if (verifyDoc.exists) {
-            logger.info(`✅ Token document successfully created at: ${tokenDocRef.path}`);
-            logger.info(`Document data keys: ${Object.keys(verifyDoc.data() || {}).join(', ')}`);
-        } else {
-            logger.error(`❌ Token document was NOT created at: ${tokenDocRef.path}`);
+            await new Promise(resolve => setTimeout(resolve, pollingInterval));
+            runStatus = await openai.beta.threads.runs.retrieve(finalThreadId, run.id);
+            logger.info(`Run status: ${runStatus.status}`);
         }
 
-        logger.info(`Successfully stored OAuth tokens for user: ${userId}`);
+        // --- HANDLE FUNCTION CALLS ---
+        if (runStatus.status === 'requires_action') {
+            const requiredActions = runStatus.required_action?.submit_tool_outputs?.tool_calls;
+            if (requiredActions) {
+                logger.info(`Processing ${requiredActions.length} function calls`);
 
-        // 7. Redirect to iOS app with success callback
-        const successUrl = `voicecalendly://oauth/success?userId=${userId}`;
-        logger.info(`Redirecting to iOS app: ${successUrl}`);
+                const toolOutputs = [];
+                for (const toolCall of requiredActions) {
+                    if (toolCall.type === 'function') {
+                        const functionName = toolCall.function.name;
+                        const functionArgs = JSON.parse(toolCall.function.arguments);
 
-        res.status(302).setHeader('Location', successUrl).send(`
-            <html>
-                <head>
-                    <title>Redirecting...</title>
-                    <meta http-equiv="refresh" content="0;url=${successUrl}">
-                </head>
-                <body>
-                    <p>Authorization successful! Redirecting to app...</p>
-                    <p>If you're not redirected automatically, <a href="${successUrl}">click here</a>.</p>
-                </body>
-            </html>
-        `);
+                        const functionResult = await handleFunctionCall(
+                            functionName,
+                            functionArgs,
+                            userId,
+                            userTimezone,
+                            data.googleCalendarToken
+                        );
+
+                        toolOutputs.push({
+                            tool_call_id: toolCall.id,
+                            output: JSON.stringify(functionResult)
+                        });
+                    }
+                }
+
+                // Submit tool outputs
+                runStatus = await openai.beta.threads.runs.submitToolOutputs(finalThreadId, run.id, {
+                    tool_outputs: toolOutputs
+                });
+
+                // Poll again for completion
+                while (runStatus.status === 'queued' || runStatus.status === 'in_progress') {
+                    if (Date.now() - startTime > maxPollingTime) {
+                        throw new Error('Assistant run timed out after function calls');
+                    }
+                    await new Promise(resolve => setTimeout(resolve, pollingInterval));
+                    runStatus = await openai.beta.threads.runs.retrieve(finalThreadId, run.id);
+                }
+            }
+        }
+
+        // --- GET ASSISTANT RESPONSE ---
+        if (runStatus.status === 'completed') {
+            const messages = await openai.beta.threads.messages.list(finalThreadId);
+            const lastMessage = messages.data[0];
+
+            if (lastMessage.role === 'assistant') {
+                const messageContent = lastMessage.content[0];
+                if (messageContent.type === 'text') {
+                    const assistantResponse = messageContent.text.value;
+
+                    logger.info(`Assistant response: ${assistantResponse}`);
+
+                    return {
+                        success: true,
+                        message: assistantResponse,
+                        conversational: true,
+                        threadId: finalThreadId
+                    };
+                }
+            }
+        }
+
+        // --- HANDLE ERRORS ---
+        if (runStatus.status === 'failed') {
+            logger.error(`Assistant run failed: ${runStatus.last_error?.message}`);
+            return {
+                success: false,
+                message: "I encountered an error while processing your request. Please try again.",
+                error: runStatus.last_error?.message
+            };
+        }
+
+        // --- FALLBACK RESPONSE ---
+        return {
+            success: false,
+            message: "I couldn't process your request right now. Please try again.",
+            status: runStatus.status
+        };
 
     } catch (error) {
-        logger.error("Error in OAuth callback:", error);
+        logger.error("Error during conversational command processing:", error);
 
-        // Extract userId from state if available
-        const userId = req.query.state as string || 'unknown';
-        const errorUrl = `voicecalendly://oauth/error?userId=${userId}&error=${encodeURIComponent(error instanceof Error ? error.message : 'Unknown error')}`;
+        // Provide user-friendly error messages
+        if (error instanceof Error) {
+            if (error.message.includes('timeout')) {
+                return {
+                    success: false,
+                    message: "The request is taking longer than usual. Please try again."
+                };
+            } else if (error.message.includes('API key')) {
+                return {
+                    success: false,
+                    message: "There's a configuration issue. Please contact support."
+                };
+            }
+        }
 
-        res.status(302).setHeader('Location', errorUrl).send(`
-            <html>
-                <head>
-                    <title>Authorization Error</title>
-                    <meta http-equiv="refresh" content="0;url=${errorUrl}">
-                </head>
-                <body>
-                    <p>Authorization failed! Redirecting to app...</p>
-                    <p>If you're not redirected automatically, <a href="${errorUrl}">click here</a>.</p>
-                </body>
-            </html>
-        `);
+        return {
+            success: false,
+            message: "I encountered an error while processing your request. Please try again.",
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
     }
 });
 
 /**
- * Connect Google Calendar Function
- * Verifies calendar access for Google Sign-In users
+ * Check if user has valid Google Calendar authentication
  */
-export const connectGoogleCalendar = onCall(async (request) => {
+export const checkGoogleCalendarAuth = onCall(async (request) => {
     const { auth } = request;
 
+    // Validate user authentication
+    const userId = validateUserAuth(auth);
+    logger.info(`Checking Google Calendar auth for user: ${userId}`);
+
     try {
-        // Validate user authentication
-        if (!auth) {
-            throw new Error('User must be authenticated');
-        }
-
-        const userId = auth.uid;
-
-        // Verify the user exists and has Google account
-        const userDoc = await customDb.collection('users').doc(userId).get();
-
-        if (!userDoc.exists) {
-            throw new Error('User not found. Please sign in first.');
-        }
-
-        const userData = userDoc.data();
-        if (userData?.authProvider !== 'google') {
-            throw new Error('Google Calendar connection requires Google Sign-In');
-        }
-
-        logger.info(`Checking Google Calendar access for user: ${userId}`);
-
-        // Check if user has refresh token
+        // Check if tokens exist in Firestore
         const tokenDoc = await customDb
             .collection('artifacts')
             .doc(APP_ID)
@@ -1095,62 +1562,99 @@ export const connectGoogleCalendar = onCall(async (request) => {
             .doc('googleCalendar')
             .get();
 
-        if (tokenDoc.exists && tokenDoc.data()?.refresh_token) {
-            // User has refresh token - verify calendar access
-            try {
-                const oAuth2Client = await getGoogleOAuth2Client(userId);
-
-                // Test calendar access
-                const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
-                await calendar.calendarList.list();
-
-                // Update user document with calendar connection status
-                await customDb.collection('users').doc(userId).update({
-                    calendarConnected: true,
-                    calendarConnectedAt: FieldValue.serverTimestamp(),
-                    lastCalendarSync: FieldValue.serverTimestamp()
-                });
-
-                return {
-                    isAuthenticated: true,
-                    message: "Google Calendar is connected and accessible"
-                };
-            } catch (error) {
-                logger.error(`Calendar access failed for user ${userId}:`, error);
-                return {
-                    isAuthenticated: false,
-                    message: "Calendar access failed. Please sign in again with Google.",
-                    needsReauth: true
-                };
-            }
-        } else {
+        if (!tokenDoc.exists) {
+            logger.info(`No Google Calendar tokens found for user: ${userId}`);
             return {
-                isAuthenticated: false,
-                message: "No calendar access token found. Please sign in with Google and grant calendar permissions.",
-                needsReauth: true
+                success: false,
+                authenticated: false,
+                message: 'No Google Calendar authentication found'
             };
         }
 
+        const tokenData = tokenDoc.data();
+
+        // Check if we have the required tokens
+        if (!tokenData?.access_token) {
+            logger.info(`No access token found for user: ${userId}`);
+            return {
+                success: false,
+                authenticated: false,
+                message: 'Google Calendar authentication is incomplete'
+            };
+        }
+
+        // Check if token is expired
+        const now = Date.now();
+        const tokenExpiryTime = tokenData.expiry_date;
+
+        if (tokenExpiryTime && now >= tokenExpiryTime) {
+            logger.info(`Access token expired for user: ${userId}. iOS app needs to refresh token.`);
+            return {
+                success: false,
+                authenticated: false,
+                message: 'Google Calendar authentication expired. Please refresh in the app.'
+            };
+        }
+
+        logger.info(`Google Calendar authentication valid for user: ${userId}`);
+        return {
+            success: true,
+            authenticated: true,
+            message: 'Google Calendar authentication is valid',
+            email: tokenData.email || '',
+            name: tokenData.name || ''
+        };
+
     } catch (error) {
-        logger.error(`Error checking Google Calendar access for user ${auth?.uid}:`, error);
-        throw new Error(`Failed to check Google Calendar access: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        logger.error(`Error checking Google Calendar auth for user ${userId}:`, error);
+        return {
+            success: false,
+            authenticated: false,
+            message: 'Failed to check Google Calendar authentication',
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
     }
 });
 
-// Removed beforeUserCreate blocking function - requires GCIP (Google Cloud Identity Platform)
-// User documents are now created manually in other functions when needed
-
 /**
- * Save user refresh token for offline access
+ * Store Google Calendar authentication tokens from iOS app
  */
-async function saveUserRefreshToken(userId: string, refreshToken: string, provider: string) {
+export const storeGoogleCalendarAuth = onCall(async (request) => {
+    const { data, auth } = request;
+
+    // Validate user authentication
+    const userId = validateUserAuth(auth);
+    logger.info(`Storing Google Calendar auth for user: ${userId}`);
+
     try {
+        const {
+            accessToken,
+            refreshToken,
+            expiryDate,
+            scopes,
+            name,
+            email
+        } = data;
+
+        if (!accessToken) {
+            throw new Error('Access token is required');
+        }
+
+        // Store tokens in Firestore
         const tokenData = {
-            refresh_token: refreshToken,
-            provider: provider,
-            user_id: userId,
-            created_at: FieldValue.serverTimestamp(),
-            last_updated: FieldValue.serverTimestamp()
+            access_token: accessToken,
+            refresh_token: refreshToken || '',
+            expiry_date: expiryDate || 0,
+            scopes: scopes || ['https://www.googleapis.com/auth/calendar.events'],
+            token_type: 'Bearer',
+
+            // User profile information
+            email: email || '',
+            name: name || '',
+
+            // Metadata
+            last_updated: FieldValue.serverTimestamp(),
+            created_at: FieldValue.serverTimestamp()
         };
 
         await customDb
@@ -1162,593 +1666,15 @@ async function saveUserRefreshToken(userId: string, refreshToken: string, provid
             .doc('googleCalendar')
             .set(tokenData, { merge: true });
 
-        logger.info(`✅ Refresh token saved for user: ${userId}`);
-    } catch (error) {
-        logger.error(`Error saving refresh token for user ${userId}:`, error);
-    }
-}
-
-// Removed unused setupGoogleCalendarIntegration function
-
-// Enhanced function to check if a user already has valid tokens
-export const checkGoogleCalendarAuth = onCall(async (request) => {
-    const { auth } = request;
-
-    try {
-        // Validate user authentication
-        if (!auth) {
-            logger.error('checkGoogleCalendarAuth: No authentication provided');
-            return {
-                isAuthenticated: false,
-                error: 'User must be authenticated',
-                message: 'Please sign in first'
-            };
-        }
-
-        const userId = auth.uid;
-        logger.info(`Checking Google Calendar auth status for user: ${userId}`);
-
-        // Verify the user exists and has Google account
-        const userDoc = await customDb.collection('users').doc(userId).get();
-
-        if (!userDoc.exists) {
-            logger.info(`User document not found for user: ${userId}`);
-            return {
-                isAuthenticated: false,
-                error: 'User not found',
-                message: 'Please sign in first',
-                needsReauth: true
-            };
-        }
-
-        const userData = userDoc.data();
-        if (userData?.authProvider !== 'google') {
-            logger.info(`User ${userId} is not signed in with Google. Auth provider: ${userData?.authProvider}`);
-            return {
-                isAuthenticated: false,
-                error: 'Google Calendar connection requires Google Sign-In',
-                message: 'Please sign in with Google to connect calendar',
-                needsReauth: true
-            };
-        }
-
-        // Check if tokens exist in Firestore
-        const tokenDoc = await customDb
-            .collection('artifacts')
-            .doc(APP_ID)
-            .collection('users')
-            .doc(userId)
-            .collection('tokens')
-            .doc('googleCalendar')
-            .get();
-
-        if (!tokenDoc.exists || !tokenDoc.data()?.refresh_token) {
-            // User needs to authenticate - generate auth URL
-            const oAuth2Client = new google.auth.OAuth2(
-                GOOGLE_CLIENT_ID,
-                GOOGLE_CLIENT_SECRET,
-                REDIRECT_URI
-            );
-
-            const authUrl = oAuth2Client.generateAuthUrl({
-                access_type: 'offline',
-                prompt: 'consent', // Force to get refresh token
-                scope: [
-                    'https://www.googleapis.com/auth/calendar.events',
-                    'https://www.googleapis.com/auth/userinfo.profile',
-                    'https://www.googleapis.com/auth/userinfo.email'
-                ],
-                state: userId // Pass user ID as state
-            });
-
-            return {
-                isAuthenticated: false,
-                authUrl: authUrl,
-                message: "Please complete Google Calendar authorization"
-            };
-        }
-
-        // User already has tokens - validate and refresh if needed
-        try {
-            const oAuth2Client = await getGoogleOAuth2Client(userId);
-
-            // Check token expiration
-            const tokenData = tokenDoc.data();
-            const now = Date.now();
-            const tokenExpiry = tokenData?.expiry_date;
-            const fiveMinutesInMs = 5 * 60 * 1000;
-
-            if (tokenExpiry && now + fiveMinutesInMs >= tokenExpiry) {
-                logger.info(`Tokens expiring soon for user ${userId}, refreshing...`);
-
-                // Refresh tokens automatically
-                const refreshResponse = await oAuth2Client.refreshAccessToken();
-                const newTokens = refreshResponse.credentials;
-
-                // Update tokens in Firestore
-                await customDb
-                    .collection('artifacts')
-                    .doc(APP_ID)
-                    .collection('users')
-                    .doc(userId)
-                    .collection('tokens')
-                    .doc('googleCalendar')
-                    .update({
-                        access_token: newTokens.access_token,
-                        expiry_date: newTokens.expiry_date,
-                        last_updated: FieldValue.serverTimestamp()
-                    });
-
-                logger.info(`✅ Tokens refreshed successfully for user: ${userId}`);
-            }
-
-            return {
-                isAuthenticated: true,
-                message: "Google Calendar is connected",
-                tokensValid: true,
-                lastUpdated: tokenData?.last_updated
-            };
-
-        } catch (error) {
-            // Token refresh failed or other issue
-            logger.error(`Token validation failed for user ${userId}:`, error);
-
-            // Generate new auth URL
-            const oAuth2Client = new google.auth.OAuth2(
-                GOOGLE_CLIENT_ID,
-                GOOGLE_CLIENT_SECRET,
-                REDIRECT_URI
-            );
-
-            const authUrl = oAuth2Client.generateAuthUrl({
-                access_type: 'offline',
-                prompt: 'consent',
-                scope: [
-                    'https://www.googleapis.com/auth/calendar.events',
-                    'https://www.googleapis.com/auth/userinfo.profile',
-                    'https://www.googleapis.com/auth/userinfo.email'
-                ],
-                state: userId
-            });
-
-            return {
-                isAuthenticated: false,
-                authUrl: authUrl,
-                error: error instanceof Error ? error.message : "Unknown error",
-                needsReauth: true
-            };
-        }
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        logger.error(`Error checking Google Calendar auth for user ${auth?.uid || 'unknown'}:`, error);
-
-        return {
-            isAuthenticated: false,
-            error: errorMessage,
-            message: `Failed to check Google Calendar authentication: ${errorMessage}`,
-            needsReauth: true
-        };
-    }
-});
-
-/**
- * Google Sign-In Authentication Function
- * Handles Google Sign-In with calendar access and creates/updates user in Firestore
- */
-export const googleSignIn = onCall(async (request) => {
-    const { data } = request;
-    const { googleIdToken, accessToken, refreshToken } = data;
-
-    try {
-        // Validate input
-        if (!googleIdToken) {
-            throw new Error('Google ID token is required');
-        }
-
-        // Verify Google ID token server-side
-        const { OAuth2Client } = require('google-auth-library');
-        const client = new OAuth2Client(GOOGLE_CLIENT_ID);
-
-        const ticket = await client.verifyIdToken({
-            idToken: googleIdToken,
-            audience: GOOGLE_CLIENT_ID
-        });
-
-        const payload = ticket.getPayload();
-        if (!payload) {
-            throw new Error('Invalid Google ID token');
-        }
-
-        const googleUserId = payload.sub;
-        const email = payload.email;
-        const name = payload.name;
-        const picture = payload.picture;
-
-        logger.info(`Google Sign-In verified for user: ${googleUserId}, email: ${email}`);
-
-        // Create or update user in Firestore
-        const userDocRef = customDb.collection('users').doc(googleUserId);
-        const userDoc = await userDocRef.get();
-
-        let isNewUser = false;
-        let userData;
-
-        if (!userDoc.exists) {
-            // Create new user
-            userData = {
-                userId: googleUserId,
-                email: email,
-                name: name,
-                picture: picture,
-                googleAccessToken: accessToken,
-                createdAt: FieldValue.serverTimestamp(),
-                lastLogin: FieldValue.serverTimestamp(),
-                status: 'active',
-                authProvider: 'google'
-            };
-
-            await userDocRef.set(userData);
-            isNewUser = true;
-            logger.info(`Created new user: ${googleUserId}`);
-        } else {
-            // Update existing user
-            userData = {
-                ...userDoc.data(),
-                lastLogin: FieldValue.serverTimestamp(),
-                googleAccessToken: accessToken,
-                email: email,
-                name: name,
-                picture: picture
-            };
-
-            await userDocRef.update({
-                lastLogin: FieldValue.serverTimestamp(),
-                googleAccessToken: accessToken,
-                email: email,
-                name: name,
-                picture: picture
-            });
-
-            logger.info(`Updated existing user: ${googleUserId}`);
-        }
-
-        // Store refresh token for calendar access
-        if (refreshToken) {
-            await saveUserRefreshToken(googleUserId, refreshToken, 'google.com');
-            logger.info(`✅ Refresh token stored for user: ${googleUserId}`);
-        }
+        logger.info(`Google Calendar tokens stored successfully for user: ${userId}`);
 
         return {
             success: true,
-            userId: googleUserId,
-            isNewUser: isNewUser,
-            userData: userData,
-            hasRefreshToken: !!refreshToken
+            message: 'Google Calendar authentication stored successfully'
         };
 
     } catch (error) {
-        logger.error('Error in Google Sign-In:', error);
-        throw new Error(`Google Sign-In failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        logger.error(`Error storing Google Calendar auth for user ${userId}:`, error);
+        throw new Error(`Failed to store Google Calendar authentication: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
 });
-
-/**
- * Refresh Google Tokens Function
- * Refreshes expired Google tokens for Google Sign-In users
- */
-export const refreshGoogleTokens = onCall(async (request) => {
-    const { auth } = request;
-
-    try {
-        // Validate user authentication
-        if (!auth) {
-            throw new Error('User must be authenticated');
-        }
-
-        const userId = auth.uid;
-
-        // Verify the user exists and has Google account
-        const userDoc = await customDb.collection('users').doc(userId).get();
-
-        if (!userDoc.exists) {
-            throw new Error('User not found. Please sign in first.');
-        }
-
-        const userData = userDoc.data();
-        if (userData?.authProvider !== 'google') {
-            throw new Error('Token refresh requires Google Sign-In');
-        }
-
-        logger.info(`Refreshing Google tokens for user: ${userId}`);
-
-        // Check if user has calendar tokens
-        const tokenDoc = await customDb
-            .collection('artifacts')
-            .doc(APP_ID)
-            .collection('users')
-            .doc(userId)
-            .collection('tokens')
-            .doc('googleCalendar')
-            .get();
-
-        if (!tokenDoc.exists || !tokenDoc.data()?.refresh_token) {
-            throw new Error('No Google Calendar tokens found. Please connect your calendar first.');
-        }
-
-        // Try to refresh tokens
-        try {
-            await getGoogleOAuth2Client(userId);
-
-            // The getGoogleOAuth2Client function already handles token refresh
-            // If we get here, tokens are valid
-            return {
-                isRefreshed: true,
-                message: "Tokens are valid and up to date"
-            };
-
-        } catch (error) {
-            logger.error(`Token refresh failed for user ${userId}:`, error);
-
-            // If refresh failed, user needs to re-authenticate
-            return {
-                isRefreshed: false,
-                needsReauth: true,
-                error: error instanceof Error ? error.message : 'Unknown error',
-                message: "Tokens are expired. Please reconnect your Google Calendar."
-            };
-        }
-
-    } catch (error) {
-        logger.error(`Error refreshing tokens for user ${auth?.uid}:`, error);
-        throw new Error(`Failed to refresh tokens: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-});
-
-/**
- * Store Google Calendar Authentication Tokens
- * Securely stores access tokens and refresh tokens with proper validation
- */
-export const storeGoogleCalendarAuth = onCall(async (request) => {
-    const { data, auth } = request;
-
-    try {
-        // Validate user authentication
-        if (!auth) {
-            logger.error('storeGoogleCalendarAuth: No authentication provided');
-            throw new Error('User must be authenticated');
-        }
-
-        const userId = auth.uid;
-        logger.info(`Storing Google Calendar tokens for user: ${userId}`);
-        logger.info(`Received data keys: ${Object.keys(data || {}).join(', ')}`);
-
-        // Extract and validate required parameters
-        const {
-            accessToken,
-            refreshToken,
-            expiryDate,
-            scopes,
-            name,
-            email
-        } = data || {};
-
-        // Enhanced validation with specific error messages
-        if (!accessToken) {
-            logger.error('storeGoogleCalendarAuth: Missing accessToken');
-            throw new Error('Access token is required for calendar integration');
-        }
-
-        if (!refreshToken) {
-            logger.error('storeGoogleCalendarAuth: Missing refreshToken');
-            throw new Error('Refresh token is required for offline access');
-        }
-
-        if (!email) {
-            logger.error('storeGoogleCalendarAuth: Missing email');
-            throw new Error('Email is required for user identification');
-        }
-
-        // Create or update user document with provided data
-        const userDoc = await customDb.collection('users').doc(userId).get();
-
-        if (!userDoc.exists) {
-            // Create user document with provided information
-            const newUserData = {
-                userId: userId,
-                email: email,
-                name: name || 'Unknown',
-                authProvider: 'google',
-                createdAt: FieldValue.serverTimestamp(),
-                lastLogin: FieldValue.serverTimestamp(),
-                status: 'active'
-            };
-
-            await customDb.collection('users').doc(userId).set(newUserData);
-            logger.info(`Created new user document for: ${userId}`);
-        } else {
-            // Update existing user document
-            const updateData: any = {
-                email: email,
-                lastLogin: FieldValue.serverTimestamp()
-            };
-
-            if (name) {
-                updateData.name = name;
-            }
-
-            // Only update authProvider if not already set or if it's different
-            const userData = userDoc.data();
-            if (!userData?.authProvider || userData.authProvider !== 'google') {
-                updateData.authProvider = 'google';
-            }
-
-            await customDb.collection('users').doc(userId).update(updateData);
-            logger.info(`Updated existing user document for: ${userId}`);
-        }
-
-        // Process token expiration
-        const now = Date.now();
-        let tokenExpiry: number | null = null;
-
-        if (expiryDate) {
-            // Handle different expiry date formats
-            if (typeof expiryDate === 'number') {
-                tokenExpiry = expiryDate;
-            } else if (typeof expiryDate === 'string') {
-                tokenExpiry = new Date(expiryDate).getTime();
-            }
-
-            if (tokenExpiry && isNaN(tokenExpiry)) {
-                logger.warn(`Invalid expiry date format: ${expiryDate}, using current time + 1 hour`);
-                tokenExpiry = now + (60 * 60 * 1000); // 1 hour from now
-            }
-        } else {
-            // Default to 1 hour if no expiry provided
-            tokenExpiry = now + (60 * 60 * 1000);
-            logger.info('No expiry date provided, defaulting to 1 hour from now');
-        }
-
-        if (tokenExpiry && tokenExpiry <= now) {
-            logger.warn(`Access token has already expired (${new Date(tokenExpiry).toISOString()}), but proceeding with storage for refresh token use`);
-        }
-
-        // Prepare token data
-        const tokenData = {
-            access_token: accessToken,
-            refresh_token: refreshToken,
-            expiry_date: tokenExpiry,
-            scopes: scopes || [
-                'https://www.googleapis.com/auth/calendar.events',
-                'https://www.googleapis.com/auth/calendar.readonly',
-                'https://www.googleapis.com/auth/calendar'
-            ],
-            last_updated: FieldValue.serverTimestamp(),
-            user_id: userId,
-            auth_provider: 'google',
-            token_version: '1.1', // Updated version
-            is_encrypted: false // Firebase automatically encrypts at rest
-        };
-
-        // Store tokens in Firestore with proper path structure
-        const tokenDocRef = customDb
-            .collection('artifacts')
-            .doc(APP_ID)
-            .collection('users')
-            .doc(userId)
-            .collection('tokens')
-            .doc('googleCalendar');
-
-        logger.info(`Storing tokens at path: ${tokenDocRef.path}`);
-        await tokenDocRef.set(tokenData, { merge: true });
-
-        // Verify the document was created
-        const verifyDoc = await tokenDocRef.get();
-        if (!verifyDoc.exists) {
-            logger.error('Failed to create token document after set operation');
-            throw new Error('Failed to store tokens in Firestore - document not created');
-        }
-
-        const storedData = verifyDoc.data();
-        logger.info(`✅ Token document created successfully. Keys: ${Object.keys(storedData || {}).join(', ')}`);
-
-        // Update user document with calendar connection status
-        await customDb.collection('users').doc(userId).update({
-            calendarConnected: true,
-            calendarConnectedAt: FieldValue.serverTimestamp(),
-            lastCalendarSync: FieldValue.serverTimestamp()
-        });
-
-        logger.info(`✅ Successfully stored Google Calendar tokens for user: ${userId}`);
-
-        return {
-            success: true,
-            message: "Google Calendar tokens stored successfully",
-            userId: userId,
-            tokenStored: true,
-            expiryDate: tokenExpiry,
-            tokenPath: tokenDocRef.path
-        };
-
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-        logger.error(`❌ Error storing Google Calendar tokens for user ${auth?.uid || 'unknown'}:`, error);
-
-        // Return a structured error response instead of throwing
-        return {
-            success: false,
-            message: `Failed to store Google Calendar tokens: ${errorMessage}`,
-            error: errorMessage,
-            userId: auth?.uid || null
-        };
-    }
-});
-
-// Add this function to create user document when they first authenticate
-async function createUserIfNotExists(userId: string) {
-    try {
-        const userDoc = await customDb.collection('users').doc(userId).get();
-
-        if (!userDoc.exists) {
-            // Create user document
-            await customDb.collection('users').doc(userId).set({
-                userId: userId,
-                createdAt: FieldValue.serverTimestamp(),
-                lastLogin: FieldValue.serverTimestamp(),
-                status: 'active'
-            });
-
-            logger.info(`Created new user document for: ${userId}`);
-        } else {
-            // Update last login
-            await customDb.collection('users').doc(userId).update({
-                lastLogin: FieldValue.serverTimestamp()
-            });
-        }
-    } catch (error) {
-        logger.error(`Error creating/updating user document for ${userId}:`, error);
-    }
-}
-
-/**
- * Simple test function to verify OpenAI API key is working
- * This function doesn't require authentication for easy testing
- */
-export const testOpenAI = onRequest({ secrets: [OPENAI_API_KEY2] }, async (req, res) => {
-    try {
-        logger.info("Testing OpenAI API connection...");
-
-        if (!OPENAI_API_KEY2.value()) {
-            logger.error("OpenAI API key not configured");
-            res.status(500).json({ error: "API key not configured" });
-            return;
-        }
-
-        const testResponse = await fetch(OPENAI_API_URL, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${OPENAI_API_KEY2.value()}`
-            },
-            body: JSON.stringify({
-                model: "gpt-4o-mini",
-                messages: [{ role: "user", content: "Hello, this is a test" }],
-                max_tokens: 10
-            })
-        });
-
-        if (!testResponse.ok) {
-            const errorBody = await testResponse.text();
-            logger.error(`OpenAI API error: ${testResponse.status}, body: ${errorBody}`);
-            res.status(500).json({ error: "OpenAI API failed", details: errorBody });
-            return;
-        }
-
-        const result = await testResponse.json();
-        logger.info("OpenAI API test successful!");
-        res.json({ success: true, message: "OpenAI API key is working!", result: result });
-
-    } catch (error) {
-        logger.error("Error testing OpenAI API:", error);
-        res.status(500).json({ error: "Test failed", details: error instanceof Error ? error.message : String(error) });
-    }
-}); 

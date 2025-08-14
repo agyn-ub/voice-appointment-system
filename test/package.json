@@ -1,0 +1,21 @@
+{
+  "name": "voice-calendar-tests",
+  "version": "1.0.0",
+  "description": "Testing suite for voice calendar Firebase functions",
+  "main": "test-setup.js",
+  "scripts": {
+    "test": "node run-tests.js",
+    "test:voice": "node test-voice-commands.js",
+    "test:calendar": "node test-calendar-sync.js",
+    "test:data": "node test-data-validation.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0",
+    "firebase": "^10.7.0",
+    "googleapis": "^132.0.0",
+    "dotenv": "^16.0.0",
+    "colors": "^1.4.0"
+  },
+  "author": "Voice Calendar Testing Suite",
+  "license": "MIT"
+}
