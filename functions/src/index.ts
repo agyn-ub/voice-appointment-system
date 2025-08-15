@@ -99,6 +99,43 @@ const CALENDAR_FUNCTION_TOOLS = [
     {
         type: "function" as const,
         function: {
+            name: "preview_appointments_for_cancellation",
+            description: "Show appointments that will be cancelled and request confirmation before bulk deletion",
+            parameters: {
+                type: "object",
+                properties: {
+                    date: {
+                        type: "string",
+                        description: "Date in YYYY-MM-DD format"
+                    },
+                    appointments_to_cancel: {
+                        type: "array",
+                        items: {
+                            type: "object",
+                            properties: {
+                                title: { type: "string" },
+                                time: { type: "string" },
+                                attendees: { 
+                                    type: "array",
+                                    items: { type: "string" }
+                                }
+                            }
+                        },
+                        description: "List of appointments that will be cancelled"
+                    },
+                    cancellation_type: {
+                        type: "string",
+                        enum: ["all", "specific"],
+                        description: "Whether cancelling all appointments or specific ones"
+                    }
+                },
+                required: ["date", "appointments_to_cancel", "cancellation_type"]
+            }
+        }
+    },
+    {
+        type: "function" as const,
+        function: {
             name: "schedule_appointment",
             description: "Schedule a business appointment or meeting with other people",
             parameters: {
@@ -208,6 +245,27 @@ const CALENDAR_FUNCTION_TOOLS = [
     {
         type: "function" as const,
         function: {
+            name: "cancel_all_appointments_for_date",
+            description: "Efficiently cancel ALL appointments/events/meetings/calendar items for a specific date in one operation. Use when user says: cancel all events, delete all appointments, clear schedule, remove everything, etc. for any date.",
+            parameters: {
+                type: "object",
+                properties: {
+                    start_date: {
+                        type: "string",
+                        description: "Start date in YYYY-MM-DD format"
+                    },
+                    end_date: {
+                        type: "string",
+                        description: "End date in YYYY-MM-DD format (optional, defaults to start_date)"
+                    }
+                },
+                required: ["start_date"]
+            }
+        }
+    },
+    {
+        type: "function" as const,
+        function: {
             name: "get_appointments",
             description: "Retrieve appointments and events for a specific date or date range",
             parameters: {
@@ -290,39 +348,30 @@ const CALENDAR_FUNCTION_TOOLS = [
 ];
 
 /**
- * Get or create OpenAI Assistant for the voice calendar
+ * Get assistant instructions with current date
  */
-async function getOrCreateAssistant(): Promise<string> {
-    const openai = getOpenAIClient();
-    
-    try {
-        // Check if we have a stored assistant ID
-        const configDoc = await customDb.collection('config').doc('assistant').get();
-        
-        if (configDoc.exists) {
-            const assistantId = configDoc.data()?.assistantId;
-            
-            if (assistantId) {
-                // Verify the assistant still exists
-                try {
-                    await openai.beta.assistants.retrieve(assistantId);
-                    logger.info(`Using existing assistant: ${assistantId}`);
-                    return assistantId;
-                } catch (error) {
-                    logger.warn(`Stored assistant ${assistantId} not found, creating new one`);
-                }
-            }
-        }
-        
-        // Create new assistant if none exists or stored one is invalid
-        logger.info('Creating new OpenAI Assistant');
-        
-        const today = new Date().toISOString().slice(0, 10);
-        
-        // Assistant instructions for conversational calendar management
-        const instructions = `You are a helpful and intelligent voice calendar assistant. Your role is to help users manage their calendar through natural conversation.
+function getAssistantInstructions(today: string): string {
+    return `You are a helpful and intelligent voice calendar assistant. Your role is to help users manage their calendar through natural conversation.
+
+**🚨 CRITICAL RULE #1 🚨**
+If user says "cancel all [events/appointments/meetings] for [any date]":
+→ IMMEDIATELY use cancel_all_appointments_for_date
+→ DO NOT use get_appointments
+→ DO NOT use multiple cancel_appointment calls
+→ This is the MOST IMPORTANT RULE
 
 Today's date is ${today}. Use this as reference for relative dates like "tomorrow", "next week", etc.
+
+**IMPORTANT Vocabulary Understanding:**
+These terms are SYNONYMS and mean the SAME thing - treat them identically:
+- "appointments" = "events" = "meetings" = "calendar items" = "schedule"
+- "cancel" = "delete" = "remove" = "clear"
+- "all" = "everything" = "entire"
+
+Examples that mean the same thing:
+- "cancel all events" = "cancel all appointments"
+- "clear my schedule" = "delete all appointments"
+- "remove everything" = "cancel all events"
 
 **Conversation Style:**
 - Be conversational, friendly, and helpful
@@ -336,6 +385,49 @@ Today's date is ${today}. Use this as reference for relative dates like "tomorro
 3. **Cancel Events:** Remove or delete existing calendar items  
 4. **View Calendar:** Show upcoming appointments and events
 5. **Set Availability:** Configure weekly availability schedule
+
+**Bulk Cancellation - OPTIMIZED:**
+When user wants to cancel/delete/clear/remove ALL appointments/events/meetings for a date, ALWAYS use cancel_all_appointments_for_date.
+
+Examples that MUST trigger cancel_all_appointments_for_date:
+- "cancel all events for tomorrow"
+- "cancel all events for 18th of August"
+- "cancel all appointments for August 26"
+- "delete all events on Monday"
+- "clear my schedule for Friday"
+- "remove everything for the 26th"
+- "cancel everything tomorrow"
+- "delete all meetings on August 26"
+- "clear all events for next Tuesday"
+- ANY phrase with "cancel/delete/remove/clear" + "all/everything" + "events/appointments/meetings" + a date
+
+How to handle:
+1. Use cancel_all_appointments_for_date directly - this is a single efficient operation
+2. No need to call get_appointments first
+3. No need for confirmation - the function handles everything
+4. The function will return how many items were cancelled
+
+For SPECIFIC cancellation (with title, time, or attendees):
+- Use the regular cancel_appointment function
+
+**CRITICAL**: If the user says "all" or "everything" with any synonym of cancel/delete/remove and events/appointments/meetings, ALWAYS use cancel_all_appointments_for_date.
+
+**⚠️ WARNING - NEVER DO THIS ⚠️**:
+- NEVER call cancel_appointment multiple times for bulk cancellation
+- NEVER call get_appointments followed by multiple cancel_appointment calls
+- If the user wants to cancel ALL items for a date, you MUST use cancel_all_appointments_for_date
+- Using multiple cancel_appointment calls will cause TIMEOUTS and is FORBIDDEN
+- Even if you find multiple appointments, DO NOT cancel them one by one
+
+**✅ ALWAYS DO THIS ✅**:
+- For "cancel all [events/appointments/meetings] for [date]" → Use cancel_all_appointments_for_date ONLY
+- This is ONE function call that handles everything efficiently
+- It returns how many items were cancelled
+
+**Confirmation Context:**
+- If user previously saw a confirmation request and responds with "yes", "confirm", "go ahead", check if there's a pending bulk cancellation
+- If there is a pending operation, execute it
+- Clear context after execution or denial
 
 **Smart Context Detection:**
 - Personal events (doctor, dentist, gym, workout, personal appointment): Use create_personal_event
@@ -406,6 +498,70 @@ You: "✅ Doctor appointment Tuesday at 10 AM added to Google Calendar"
 - Use the track_partial_appointment function to store collected data
 - When resuming, remind the user what information you already have
 - Example: "I see we were scheduling a doctor's appointment for tomorrow. What time works best?"`;
+}
+
+/**
+ * Get or create OpenAI Assistant for the voice calendar
+ */
+async function getOrCreateAssistant(): Promise<string> {
+    const openai = getOpenAIClient();
+    
+    try {
+        // FORCE RECREATION: Delete existing assistant to ensure new tools and instructions are used
+        // This prevents cached behavior patterns from old assistant
+        const configDoc = await customDb.collection('config').doc('assistant').get();
+        
+        if (configDoc.exists) {
+            const assistantId = configDoc.data()?.assistantId;
+            const lastModel = configDoc.data()?.model;
+            
+            // Check if we need to recreate due to wrong model
+            if (lastModel && lastModel !== "gpt-4o-mini") {
+                logger.warn(`⚠️ WRONG MODEL DETECTED: ${lastModel}. Forcing recreation with gpt-4o-mini`);
+                // Delete the old assistant
+                if (assistantId) {
+                    try {
+                        await openai.beta.assistants.del(assistantId);
+                        logger.info(`Deleted old assistant ${assistantId} that was using expensive model ${lastModel}`);
+                    } catch (error) {
+                        logger.warn(`Could not delete old assistant: ${error}`);
+                    }
+                }
+            } else if (assistantId) {
+                // Verify the assistant still exists and check its model
+                try {
+                    const assistant = await openai.beta.assistants.retrieve(assistantId);
+                    logger.info(`Found existing assistant: ${assistantId}, model: ${assistant.model}`);
+                    
+                    // CRITICAL: Verify it's using the cheap model
+                    if (assistant.model !== "gpt-4o-mini") {
+                        logger.error(`⚠️ EXPENSIVE MODEL DETECTED: ${assistant.model}. Deleting and recreating...`);
+                        await openai.beta.assistants.del(assistantId);
+                    } else {
+                        // Update the assistant with new instructions and tools
+                        const today = new Date().toISOString().slice(0, 10);
+                        const instructions = getAssistantInstructions(today);
+                        
+                        await openai.beta.assistants.update(assistantId, {
+                            instructions: instructions,
+                            tools: CALENDAR_FUNCTION_TOOLS,
+                            model: "gpt-4o-mini" // Force the model again
+                        });
+                        
+                        logger.info(`✅ Updated assistant ${assistantId} - confirmed using gpt-4o-mini (cheap model)`);
+                        return assistantId;
+                    }
+                } catch (error) {
+                    logger.warn(`Stored assistant ${assistantId} not found or couldn't be updated, creating new one`);
+                }
+            }
+        }
+        
+        // Create new assistant if none exists or stored one is invalid
+        logger.info('Creating new OpenAI Assistant');
+        
+        const today = new Date().toISOString().slice(0, 10);
+        const instructions = getAssistantInstructions(today);
 
         const assistant = await openai.beta.assistants.create({
             name: "Voice Calendar Assistant",
@@ -414,16 +570,25 @@ You: "✅ Doctor appointment Tuesday at 10 AM added to Google Calendar"
             tools: CALENDAR_FUNCTION_TOOLS
         });
 
-        logger.info(`Created new OpenAI Assistant: ${assistant.id}`);
+        logger.info(`✅ Created new OpenAI Assistant: ${assistant.id} with model: ${assistant.model}`);
+        
+        // CRITICAL: Verify the model is correct
+        if (assistant.model !== "gpt-4o-mini") {
+            logger.error(`⚠️⚠️⚠️ CRITICAL: Assistant created with WRONG MODEL: ${assistant.model}`);
+            logger.error(`Expected gpt-4o-mini but got ${assistant.model} - this will be EXPENSIVE!`);
+            // Try to delete and throw error
+            await openai.beta.assistants.del(assistant.id);
+            throw new Error(`Assistant created with wrong model: ${assistant.model}. Deleted to prevent high costs.`);
+        }
         
         // Store the assistant ID for future use
         await customDb.collection('config').doc('assistant').set({
             assistantId: assistant.id,
             createdAt: FieldValue.serverTimestamp(),
-            model: "gpt-4o-mini"
+            model: assistant.model // Store actual model used
         });
         
-        logger.info(`Stored assistant ID in Firestore: ${assistant.id}`);
+        logger.info(`✅ Stored assistant ID in Firestore: ${assistant.id} (model: ${assistant.model})`);
         return assistant.id;
         
     } catch (error) {
@@ -676,6 +841,57 @@ async function cancelGoogleCalendarEvent(userId: string, googleEventId: string, 
     }
 }
 
+/**
+ * Bulk cancel multiple Google Calendar events efficiently
+ */
+async function bulkCancelGoogleCalendarEvents(userId: string, eventIds: string[], accessToken: string): Promise<{ successful: string[], failed: string[] }> {
+    try {
+        logger.info(`Bulk cancelling ${eventIds.length} Google Calendar events for user ${userId}`);
+
+        if (eventIds.length === 0) {
+            return { successful: [], failed: [] };
+        }
+
+        // Get Google OAuth client with provided token
+        const oAuth2Client = await getGoogleOAuth2Client(userId, accessToken);
+
+        // Initialize Google Calendar API
+        const calendar = google.calendar({ version: 'v3', auth: oAuth2Client });
+
+        const successful: string[] = [];
+        const failed: string[] = [];
+
+        // Process deletions in parallel batches (max 10 at a time to avoid rate limits)
+        const batchSize = 10;
+        for (let i = 0; i < eventIds.length; i += batchSize) {
+            const batch = eventIds.slice(i, i + batchSize);
+            
+            await Promise.all(
+                batch.map(async (eventId) => {
+                    try {
+                        await calendar.events.delete({
+                            calendarId: 'primary',
+                            eventId: eventId
+                        });
+                        successful.push(eventId);
+                        logger.info(`Successfully cancelled Google Calendar event: ${eventId}`);
+                    } catch (error) {
+                        failed.push(eventId);
+                        logger.warn(`Failed to cancel Google Calendar event ${eventId}:`, error);
+                    }
+                })
+            );
+        }
+
+        logger.info(`Bulk cancellation complete: ${successful.length} successful, ${failed.length} failed`);
+        return { successful, failed };
+
+    } catch (error) {
+        logger.error(`Error in bulk Google Calendar cancellation:`, error);
+        throw error;
+    }
+}
+
 // Helper function to get partial appointment context
 async function getPartialAppointmentContext(userId: string): Promise<any> {
     try {
@@ -750,6 +966,64 @@ function getStatusMessage(appointment: any): string {
     }
 }
 
+// Implementation for previewing appointments before bulk cancellation
+async function previewAppointmentsForCancellation(userId: string, details: any): Promise<any> {
+    try {
+        logger.info(`Previewing appointments for cancellation for user ${userId}:`, details);
+        
+        const { date, appointments_to_cancel, cancellation_type } = details;
+        
+        // Store the pending cancellation in Firestore for later confirmation
+        await customDb
+            .collection('users')
+            .doc(userId)
+            .collection('pendingOperations')
+            .doc('currentCancellation')
+            .set({
+                type: 'bulk_cancellation',
+                date: date,
+                appointments: appointments_to_cancel,
+                cancellationType: cancellation_type,
+                createdAt: FieldValue.serverTimestamp()
+            }, { merge: true });
+        
+        logger.info(`Stored pending bulk cancellation for user ${userId}`);
+        
+        // Format the appointments list for display
+        const appointmentsList = appointments_to_cancel.map((apt: any) => {
+            let description = `• ${apt.title}`;
+            if (apt.time && apt.time !== '00:00') {
+                description += ` at ${apt.time}`;
+            }
+            if (apt.attendees && apt.attendees.length > 0) {
+                description += ` with ${apt.attendees.join(', ')}`;
+            }
+            return description;
+        }).join('\n');
+        
+        const response = {
+            success: true,
+            requiresConfirmation: true,
+            operationType: 'bulk_cancellation',
+            appointmentCount: appointments_to_cancel.length,
+            date: date,
+            appointmentsList: appointmentsList,
+            message: `I found ${appointments_to_cancel.length} appointment${appointments_to_cancel.length > 1 ? 's' : ''} for ${date}:\n\n${appointmentsList}\n\nDo you want to cancel ${cancellation_type === 'all' ? 'all of them' : 'these appointments'}?`
+        };
+        
+        logger.info(`Requesting confirmation for ${appointments_to_cancel.length} appointments`);
+        return response;
+        
+    } catch (error) {
+        logger.error(`Error previewing appointments for cancellation for user ${userId}:`, error);
+        return {
+            success: false,
+            message: `Failed to preview appointments: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
+    }
+}
+
 // Implementation for tracking partial appointment data
 async function trackPartialAppointment(userId: string, details: any): Promise<any> {
     try {
@@ -813,6 +1087,9 @@ async function handleFunctionCall(functionName: string, functionArgs: any, userI
             case 'track_partial_appointment':
                 return await trackPartialAppointment(userId, functionArgs);
 
+            case 'preview_appointments_for_cancellation':
+                return await previewAppointmentsForCancellation(userId, functionArgs);
+
             case 'schedule_appointment':
                 return await scheduleAppointment(userId, functionArgs, "Appointment scheduled successfully.", userTimezone, accessToken);
 
@@ -821,6 +1098,9 @@ async function handleFunctionCall(functionName: string, functionArgs: any, userI
 
             case 'cancel_appointment':
                 return await cancelAppointments(userId, functionArgs, accessToken);
+
+            case 'cancel_all_appointments_for_date':
+                return await cancelAllAppointmentsForDate(userId, functionArgs, accessToken);
 
             case 'get_appointments':
                 return await getAppointments(userId, functionArgs, "Here are your appointments:");
@@ -1059,7 +1339,7 @@ async function cancelAppointments(userId: string, details: any, accessToken?: st
             throw new Error('Date is required for cancelling appointments');
         }
 
-        // Build query to find matching appointments
+        // Query with proper index - efficient at scale
         let query = customDb
             .collection('users')
             .doc(userId)
@@ -1085,6 +1365,7 @@ async function cancelAppointments(userId: string, details: any, accessToken?: st
         // Filter appointments based on additional criteria
         for (const doc of querySnapshot.docs) {
             const appointment = doc.data() as AppointmentData;
+            // No need to check status - query already excludes cancelled
             let shouldCancel = true;
 
             // Check title match if provided
@@ -1166,6 +1447,112 @@ async function cancelAppointments(userId: string, details: any, accessToken?: st
     }
 }
 
+/**
+ * Bulk cancel ALL appointments for a date or date range - efficient single operation
+ */
+async function cancelAllAppointmentsForDate(userId: string, details: any, accessToken?: string): Promise<any> {
+    try {
+        const startDate = details.start_date;
+        const endDate = details.end_date || details.start_date;
+        
+        logger.info(`Bulk cancelling all appointments for user ${userId} from ${startDate} to ${endDate}`);
+
+        // Get all appointments in date range that aren't already cancelled
+        const query = customDb
+            .collection('users')
+            .doc(userId)
+            .collection('appointments')
+            .where('date', '>=', startDate)
+            .where('date', '<=', endDate)
+            .where('status', '!=', 'cancelled');
+
+        const querySnapshot = await query.get();
+
+        if (querySnapshot.empty) {
+            return {
+                success: true,
+                message: `No appointments found to cancel between ${startDate} and ${endDate}`,
+                cancelledCount: 0
+            };
+        }
+
+        // Prepare batch operation for Firestore
+        const batch = customDb.batch();
+        const googleEventIds: string[] = [];
+        const cancelledAppointments: any[] = [];
+
+        // Process all appointments
+        querySnapshot.forEach(doc => {
+            const appointment = doc.data() as AppointmentData;
+            
+            // Update status in batch
+            batch.update(doc.ref, {
+                status: 'cancelled',
+                cancelledAt: FieldValue.serverTimestamp()
+            });
+
+            // Collect Google Calendar event IDs
+            if (appointment.googleCalendarEventId) {
+                googleEventIds.push(appointment.googleCalendarEventId);
+            }
+
+            cancelledAppointments.push({
+                id: appointment.id,
+                title: appointment.title,
+                date: appointment.date,
+                time: appointment.time
+            });
+        });
+
+        // Commit all Firestore updates in one batch
+        await batch.commit();
+        logger.info(`Cancelled ${cancelledAppointments.length} appointments in Firestore`);
+
+        // Bulk cancel Google Calendar events if access token provided
+        let calendarResults: { successful: string[], failed: string[] } = { successful: [], failed: [] };
+        if (googleEventIds.length > 0 && accessToken) {
+            try {
+                calendarResults = await bulkCancelGoogleCalendarEvents(userId, googleEventIds, accessToken);
+                logger.info(`Google Calendar bulk cancellation: ${calendarResults.successful.length} successful, ${calendarResults.failed.length} failed`);
+            } catch (calendarError) {
+                logger.warn(`Google Calendar bulk cancellation failed, but local appointments were cancelled:`, calendarError);
+            }
+        }
+
+        // Format response message
+        let message = `Successfully cancelled ${cancelledAppointments.length} appointment${cancelledAppointments.length !== 1 ? 's' : ''}`;
+        
+        if (startDate === endDate) {
+            message += ` for ${startDate}`;
+        } else {
+            message += ` from ${startDate} to ${endDate}`;
+        }
+
+        if (calendarResults.failed.length > 0) {
+            message += ` (${calendarResults.failed.length} calendar sync errors)`;
+        }
+
+        return {
+            success: true,
+            message,
+            cancelledCount: cancelledAppointments.length,
+            appointments: cancelledAppointments,
+            calendarSync: {
+                successful: calendarResults.successful.length,
+                failed: calendarResults.failed.length
+            }
+        };
+
+    } catch (error) {
+        logger.error(`Error in bulk appointment cancellation for user ${userId}:`, error);
+        return {
+            success: false,
+            message: `Failed to cancel appointments: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            error: error instanceof Error ? error.message : 'Unknown error'
+        };
+    }
+}
+
 async function getAppointments(userId: string, details: any, message: string): Promise<any> {
     try {
         logger.info(`Getting appointments for user ${userId}:`, details);
@@ -1180,7 +1567,7 @@ async function getAppointments(userId: string, details: any, message: string): P
 
         logger.info(`Fetching appointments from ${startDate} to ${endDate}`);
 
-        // Build query to find appointments in date range
+        // Query with proper composite index - efficient at scale
         let query = customDb
             .collection('users')
             .doc(userId)
@@ -1189,6 +1576,7 @@ async function getAppointments(userId: string, details: any, message: string): P
             .where('date', '<=', endDate)
             .where('status', '!=', 'cancelled')
             .orderBy('date', 'asc')
+            .orderBy('status', 'asc')
             .orderBy('time', 'asc');
 
         const querySnapshot = await query.get();
@@ -1204,6 +1592,7 @@ async function getAppointments(userId: string, details: any, message: string): P
         const appointments = [];
         for (const doc of querySnapshot.docs) {
             const appointmentData = doc.data() as AppointmentData;
+            // No need to filter - query already excludes cancelled appointments
             appointments.push({
                 id: appointmentData.id,
                 title: appointmentData.title,
@@ -1219,6 +1608,7 @@ async function getAppointments(userId: string, details: any, message: string): P
             });
         }
 
+        // No need to sort - query already returns sorted results
         logger.info(`Found ${appointments.length} appointments for user ${userId}`);
 
         // Format the response message based on the date range
@@ -1336,6 +1726,12 @@ export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async 
         const threadId = await getOrCreateThread(userId);
 
         logger.info(`Using Assistant ${assistantId} and Thread ${threadId} for user ${userId}`);
+        
+        // Log approximate token usage for monitoring
+        const commandLength = userCommandText.length;
+        const instructionsLength = 8000; // Approximate instruction length
+        const estimatedInputTokens = (commandLength + instructionsLength) / 4; // Rough estimate: 4 chars per token
+        logger.info(`📊 Estimated input tokens: ~${Math.round(estimatedInputTokens)} (command: ${commandLength} chars)`);
 
         // --- CHECK FOR PARTIAL CONTEXT ---
         const partialContext = await getPartialAppointmentContext(userId);
@@ -1419,7 +1815,7 @@ export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async 
 
         // --- POLL FOR COMPLETION ---
         let runStatus = run;
-        const maxPollingTime = 30000; // 30 seconds
+        const maxPollingTime = 60000; // 60 seconds - increased for complex operations
         const pollingInterval = 1000; // 1 second
         const startTime = Date.now();
 
@@ -1465,9 +1861,12 @@ export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async 
                     tool_outputs: toolOutputs
                 });
 
-                // Poll again for completion
+                // Poll again for completion with extended timeout after function calls
+                const extendedTimeout = 90000; // 90 seconds for post-function processing
+                const functionStartTime = Date.now();
+                
                 while (runStatus.status === 'queued' || runStatus.status === 'in_progress') {
-                    if (Date.now() - startTime > maxPollingTime) {
+                    if (Date.now() - functionStartTime > extendedTimeout) {
                         throw new Error('Assistant run timed out after function calls');
                     }
                     await new Promise(resolve => setTimeout(resolve, pollingInterval));
