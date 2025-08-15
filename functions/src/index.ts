@@ -410,7 +410,7 @@ You: "✅ Doctor appointment Tuesday at 10 AM added to Google Calendar"
         const assistant = await openai.beta.assistants.create({
             name: "Voice Calendar Assistant",
             instructions: instructions,
-            model: "gpt-4-turbo-preview",
+            model: "gpt-4o-mini",
             tools: CALENDAR_FUNCTION_TOOLS
         });
 
@@ -420,7 +420,7 @@ You: "✅ Doctor appointment Tuesday at 10 AM added to Google Calendar"
         await customDb.collection('config').doc('assistant').set({
             assistantId: assistant.id,
             createdAt: FieldValue.serverTimestamp(),
-            model: "gpt-4-turbo-preview"
+            model: "gpt-4o-mini"
         });
         
         logger.info(`Stored assistant ID in Firestore: ${assistant.id}`);
