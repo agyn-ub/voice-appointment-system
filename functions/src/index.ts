@@ -160,7 +160,7 @@ const CALENDAR_FUNCTION_TOOLS = [
                     attendees: {
                         type: "array",
                         items: { type: "string" },
-                        description: "List of attendee names or emails"
+                        description: "List of attendee names (e.g., ['John', 'Sarah', 'Mike'])"
                     },
                     meeting_platform: {
                         type: "string",
@@ -434,6 +434,12 @@ For SPECIFIC cancellation (with title, time, or attendees):
 - Business meetings (meeting, call, sync, review, with [person]): Use schedule_appointment
 - Recognize when participants are NOT needed (personal events)
 
+**Attendee Handling:**
+- Accept attendee names in the attendees field (e.g., "John", "Sarah", "Mike")
+- Simply store the names as provided by the user
+- Names will be included in the appointment details and event description
+- No need to collect email addresses
+
 **Progressive Sync System:**
 
 TIER 1 - Save Locally (Date Required):
@@ -480,6 +486,9 @@ User: "Meeting with Sarah"
 You: "📝 What day should I schedule this meeting with Sarah?"
 User: "Friday afternoon"
 You: "✅ Meeting with Sarah on Friday at 2 PM added to Google Calendar"
+
+User: "Schedule a meeting with John and Mike tomorrow at 3pm"
+You: "✅ Meeting with John and Mike scheduled for tomorrow at 3 PM added to Google Calendar"
 
 User: "Doctor next week"
 You: "📱 Doctor appointment saved for next week. What day and time works best?"
@@ -707,12 +716,23 @@ async function syncAppointmentToGoogleCalendar(userId: string, appointmentData: 
         // Calculate end time
         const endTime = new Date(startTime.getTime() + (appointmentData.duration || 30) * 60000);
 
-        // Prepare event data
-        const eventData = {
+        // Clean attendee names
+        const cleanedAttendees = cleanAttendeeNames(appointmentData.attendees);
+        
+        // Build description including attendee names
+        let description = appointmentData.description || '';
+        
+        if (cleanedAttendees.length > 0) {
+            if (description) {
+                description += '\n\n';
+            }
+            description += `Attendees: ${cleanedAttendees.join(', ')}`;
+        }
+
+        // Prepare event data - only include valid emails in attendees field
+        const eventData: any = {
             summary: appointmentData.title,
-            description: appointmentData.attendees && appointmentData.attendees.length > 0
-                ? `Attendees: ${appointmentData.attendees.join(', ')}`
-                : undefined,
+            description: description || undefined,
             start: {
                 dateTime: startTime.toISOString(),
                 timeZone: 'UTC'
@@ -721,7 +741,6 @@ async function syncAppointmentToGoogleCalendar(userId: string, appointmentData: 
                 dateTime: endTime.toISOString(),
                 timeZone: 'UTC'
             },
-            attendees: appointmentData.attendees?.map(email => ({ email })) || [],
             conferenceData: appointmentData.meetingLink?.includes('meet.google.com') ? {
                 createRequest: {
                     requestId: appointmentData.id,
@@ -729,6 +748,9 @@ async function syncAppointmentToGoogleCalendar(userId: string, appointmentData: 
                 }
             } : undefined
         };
+        
+        // Note: Not adding attendees to Google Calendar since we're not collecting emails
+        logger.info(`Creating Google Calendar event without email invites (attendees stored as names only)`);
 
         // Create the event
         const response = await calendar.events.insert({
@@ -951,6 +973,18 @@ function isReadyForGoogleCalendar(appointment: any): boolean {
     return !!(appointment.date && appointment.time);
 }
 
+// Helper function to clean attendee names
+function cleanAttendeeNames(attendees: string[] | undefined): string[] {
+    if (!attendees || attendees.length === 0) {
+        return [];
+    }
+    
+    return attendees
+        .map(attendee => attendee.trim())
+        .filter(attendee => attendee.length > 0);
+}
+
+
 // Helper function to get status message
 function getStatusMessage(appointment: any): string {
     if (!appointment.date) {
@@ -1079,7 +1113,7 @@ async function trackPartialAppointment(userId: string, details: any): Promise<an
 }
 
 // Helper function to handle function calls from OpenAI Assistant
-async function handleFunctionCall(functionName: string, functionArgs: any, userId: string, userTimezone: string = 'America/Los_Angeles', accessToken?: string): Promise<any> {
+async function handleFunctionCall(functionName: string, functionArgs: any, userId: string, accessToken?: string): Promise<any> {
     logger.info(`Executing function: ${functionName} with args:`, JSON.stringify(functionArgs));
 
     try {
@@ -1091,10 +1125,10 @@ async function handleFunctionCall(functionName: string, functionArgs: any, userI
                 return await previewAppointmentsForCancellation(userId, functionArgs);
 
             case 'schedule_appointment':
-                return await scheduleAppointment(userId, functionArgs, "Appointment scheduled successfully.", userTimezone, accessToken);
+                return await scheduleAppointment(userId, functionArgs, accessToken);
 
             case 'create_personal_event':
-                return await createPersonalEvent(userId, functionArgs, "Personal event created successfully.", userTimezone, accessToken);
+                return await createPersonalEvent(userId, functionArgs, accessToken);
 
             case 'cancel_appointment':
                 return await cancelAppointments(userId, functionArgs, accessToken);
@@ -1122,7 +1156,7 @@ async function handleFunctionCall(functionName: string, functionArgs: any, userI
 }
 
 // Implementation for scheduling appointments
-async function scheduleAppointment(userId: string, details: any, message: string, timezone: string, accessToken?: string): Promise<any> {
+async function scheduleAppointment(userId: string, details: any, accessToken?: string): Promise<any> {
     try {
         logger.info(`Scheduling appointment for user ${userId}:`, details);
 
@@ -1146,7 +1180,7 @@ async function scheduleAppointment(userId: string, details: any, message: string
             date: details.date,
             time: details.time || null,  // null for all-day or TBD
             duration: details.time ? (details.duration || 30) : null,  // Only set if has time
-            attendees: details.attendees || [],
+            attendees: cleanAttendeeNames(details.attendees),  // Store cleaned attendee names
             timestamp: new Date(),
             status: 'scheduled',
             createdAt: FieldValue.serverTimestamp(),
@@ -1175,6 +1209,11 @@ async function scheduleAppointment(userId: string, details: any, message: string
             .set(appointmentData);
 
         logger.info(`Appointment saved to Firestore for user ${userId}: ${appointmentId}`);
+        
+        // Log attendee info
+        if (appointmentData.attendees && appointmentData.attendees.length > 0) {
+            logger.info(`Attendees stored: ${appointmentData.attendees.join(', ')}`);
+        }
         
         // Clear any partial appointment context after successful creation
         await clearPartialAppointmentContext(userId);
@@ -1231,7 +1270,7 @@ async function scheduleAppointment(userId: string, details: any, message: string
     }
 }
 
-async function createPersonalEvent(userId: string, details: any, message: string, timezone: string, accessToken?: string): Promise<any> {
+async function createPersonalEvent(userId: string, details: any, accessToken?: string): Promise<any> {
     try {
         logger.info(`Creating personal event for user ${userId}:`, details);
 
@@ -1845,7 +1884,6 @@ export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async 
                             functionName,
                             functionArgs,
                             userId,
-                            userTimezone,
                             data.googleCalendarToken
                         );
 
