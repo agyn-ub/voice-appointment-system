@@ -350,7 +350,7 @@ const CALENDAR_FUNCTION_TOOLS = [
 /**
  * Get assistant instructions with current date
  */
-function getAssistantInstructions(today: string): string {
+function getAssistantInstructions(today: string, timezone: string = 'UTC'): string {
     return `You are a helpful and intelligent voice calendar assistant. Your role is to help users manage their calendar through natural conversation.
 
 **🚨 CRITICAL RULE #1 🚨**
@@ -360,7 +360,7 @@ If user says "cancel all [events/appointments/meetings] for [any date]":
 → DO NOT use multiple cancel_appointment calls
 → This is the MOST IMPORTANT RULE
 
-Today's date is ${today}. Use this as reference for relative dates like "tomorrow", "next week", etc.
+Today's date is ${today} (in timezone: ${timezone}). Use this as reference for relative dates like "tomorrow", "next week", etc. IMPORTANT: All relative date calculations must be based on this date in the user's timezone.
 
 **IMPORTANT Vocabulary Understanding:**
 These terms are SYNONYMS and mean the SAME thing - treat them identically:
@@ -512,7 +512,7 @@ You: "✅ Doctor appointment Tuesday at 10 AM added to Google Calendar"
 /**
  * Get or create OpenAI Assistant for the voice calendar
  */
-async function getOrCreateAssistant(): Promise<string> {
+async function getOrCreateAssistant(timezone: string = 'UTC'): Promise<string> {
     const openai = getOpenAIClient();
     
     try {
@@ -548,8 +548,8 @@ async function getOrCreateAssistant(): Promise<string> {
                         await openai.beta.assistants.del(assistantId);
                     } else {
                         // Update the assistant with new instructions and tools
-                        const today = new Date().toISOString().slice(0, 10);
-                        const instructions = getAssistantInstructions(today);
+                        const today = getCurrentDateInTimezone(timezone);
+                        const instructions = getAssistantInstructions(today, timezone);
                         
                         await openai.beta.assistants.update(assistantId, {
                             instructions: instructions,
@@ -569,8 +569,8 @@ async function getOrCreateAssistant(): Promise<string> {
         // Create new assistant if none exists or stored one is invalid
         logger.info('Creating new OpenAI Assistant');
         
-        const today = new Date().toISOString().slice(0, 10);
-        const instructions = getAssistantInstructions(today);
+        const today = getCurrentDateInTimezone(timezone);
+        const instructions = getAssistantInstructions(today, timezone);
 
         const assistant = await openai.beta.assistants.create({
             name: "Voice Calendar Assistant",
@@ -982,6 +982,31 @@ function cleanAttendeeNames(attendees: string[] | undefined): string[] {
     return attendees
         .map(attendee => attendee.trim())
         .filter(attendee => attendee.length > 0);
+}
+
+// Helper function to get current date in user's timezone
+function getCurrentDateInTimezone(timezone: string): string {
+    try {
+        // Create a date formatter for the specific timezone
+        const formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: timezone,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit'
+        });
+        
+        const parts = formatter.formatToParts(new Date());
+        const year = parts.find(p => p.type === 'year')?.value;
+        const month = parts.find(p => p.type === 'month')?.value;
+        const day = parts.find(p => p.type === 'day')?.value;
+        
+        // Return in YYYY-MM-DD format
+        return `${year}-${month}-${day}`;
+    } catch (error) {
+        logger.warn(`Failed to get date for timezone ${timezone}, falling back to UTC:`, error);
+        // Fallback to UTC if timezone is invalid
+        return new Date().toISOString().slice(0, 10);
+    }
 }
 
 
@@ -1761,7 +1786,7 @@ export const processVoiceCommand = onCall({ secrets: [OPENAI_API_KEY2] }, async 
 
     try {
         // --- ASSISTANT & THREAD MANAGEMENT ---
-        const assistantId = await getOrCreateAssistant();
+        const assistantId = await getOrCreateAssistant(userTimezone);
         const threadId = await getOrCreateThread(userId);
 
         logger.info(`Using Assistant ${assistantId} and Thread ${threadId} for user ${userId}`);
